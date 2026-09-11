@@ -1,0 +1,27 @@
+{
+  "name": "@sirhc77/supabase-auth-kit",
+  "version": "0.1.0",
+  "description": "An embedded AuthN and AuthZ library for Supabase",
+  "keywords": [
+    "authn",
+    "authz",
+    "supabase"
+  ],
+  "license": "MIT",
+  "author": "Chris Carrington <chris@megafarad.com> (https://megafarad.com)",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run --passWithNoTests"
+  },
+  "files": [
+    "dist",
+    "supabase/migrations"
+  ],
+  "bin": {
+    "supabase-auth-kit": "./dist/install-migrations.js"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1"
+  }
+}

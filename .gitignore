@@ -1,0 +1,21 @@
+.claude/settings.local.json
+.mcp.json
+.idea
+.turbo
+dist
+node_modules
+
+# Supabase CLI local state
+**/supabase/.branches
+**/supabase/.temp
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Tooling
+coverage
+*.tsbuildinfo
+*.log
+.DS_Store

@@ -1,0 +1,34 @@
+{
+  "name": "@sirhc77/supabase-auth-kit-core",
+  "version": "0.1.0",
+  "description": "Framework-agnostic core for @sirhc77/supabase-auth-kit",
+  "keywords": [
+    "authn",
+    "authz",
+    "supabase"
+  ],
+  "license": "MIT",
+  "author": "Chris Carrington <chris@megafarad.com> (https://megafarad.com)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "jose": "^6.2.10"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1"
+  }
+}

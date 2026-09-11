@@ -1,0 +1,36 @@
+{
+  "name": "@sirhc77/supabase-auth-kit-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "An embedded AuthN and AuthZ library for Supabase",
+  "keywords": [
+    "authn",
+    "authz",
+    "supabase"
+  ],
+  "license": "MIT",
+  "author": "Chris Carrington <chris@megafarad.com> (https://megafarad.com)",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "packageManager": "npm@11.19.1",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev --parallel",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "changeset:publish": "changeset publish --no-git-tag --provenance"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^3.0.2",
+    "@types/pg": "^8.15.5",
+    "pg": "^8.16.3",
+    "supabase": "^2.116.0",
+    "turbo": "^2.10.12",
+    "typescript": "^7.0.2",
+    "vitest": "^3.2.4"
+  }
+}

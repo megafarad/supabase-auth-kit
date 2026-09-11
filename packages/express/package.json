@@ -1,0 +1,43 @@
+{
+  "name": "@sirhc77/supabase-auth-kit-express",
+  "version": "0.1.0",
+  "description": "Express middleware for @sirhc77/supabase-auth-kit",
+  "keywords": [
+    "authn",
+    "authz",
+    "express",
+    "supabase"
+  ],
+  "license": "MIT",
+  "author": "Chris Carrington <chris@megafarad.com> (https://megafarad.com)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "express": "^4.0.0 || ^5.2.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^26.4.1",
+    "@types/supertest": "^6.0.3",
+    "express": "^5.2.1",
+    "express4": "npm:express@^4.21.2",
+    "supertest": "^7.1.4"
+  },
+  "dependencies": {
+    "@sirhc77/supabase-auth-kit-core": "^0.1.0"
+  }
+}
