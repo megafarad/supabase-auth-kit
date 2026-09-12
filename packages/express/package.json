@@ -22,6 +22,15 @@
   "files": [
     "dist"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/megafarad/supabase-auth-kit.git",
+    "directory": "packages/express"
+  },
+  "publishConfig": {
+    "provenance": true,
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
     "test": "vitest run"

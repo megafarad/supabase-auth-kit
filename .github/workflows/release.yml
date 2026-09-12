@@ -1,0 +1,59 @@
+name: Release
+on:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  release:
+    name: Version or publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: GitHub Checkout
+        uses: actions/checkout@v4
+        with:
+          # Changesets needs the full history to work out what changed since the last release.
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      # Trusted publishing needs npm >= 11.5.1; it mints a short-lived OIDC token from the
+      # id-token permission above, so there is no NODE_AUTH_TOKEN and no secret to rotate.
+      - name: Update NPM
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # With pending changesets this opens or refreshes the "Version Packages" PR. On the push
+      # that merges that PR there are none left, so it publishes instead.
+      - name: Version or publish
+        uses: changesets/action@v1
+        with:
+          version: npm run changeset:version
+          publish: npm run changeset:publish
+          commit: "chore: version packages"
+          title: "chore: version packages"
+          # changeset:publish runs with --no-git-tag, so there are no tags to hang releases off;
+          # the generated CHANGELOG.md files are the record.
+          createGithubReleases: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

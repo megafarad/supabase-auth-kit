@@ -26,6 +26,15 @@
     "build": "tsc",
     "test": "vitest run"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/megafarad/supabase-auth-kit.git",
+    "directory": "packages/fastify"
+  },
+  "publishConfig": {
+    "provenance": true,
+    "access": "public"
+  },
   "peerDependencies": {
     "fastify": "^5.12.3",
     "fastify-plugin": "^5.0.0 || ^6.0.0"
