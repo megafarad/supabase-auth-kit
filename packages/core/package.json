@@ -1,6 +1,6 @@
 {
   "name": "@sirhc77/supabase-auth-kit-core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Framework-agnostic core for @sirhc77/supabase-auth-kit",
   "keywords": [
     "authn",

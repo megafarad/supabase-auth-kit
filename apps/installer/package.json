@@ -1,6 +1,6 @@
 {
   "name": "@sirhc77/supabase-auth-kit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "An embedded AuthN and AuthZ library for Supabase",
   "keywords": [
     "authn",

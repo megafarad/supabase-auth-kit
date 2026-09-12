@@ -1,6 +1,6 @@
 {
   "name": "@sirhc77/supabase-auth-kit-express",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Express middleware for @sirhc77/supabase-auth-kit",
   "keywords": [
     "authn",
@@ -47,6 +47,6 @@
     "supertest": "^7.1.4"
   },
   "dependencies": {
-    "@sirhc77/supabase-auth-kit-core": "^0.1.0"
+    "@sirhc77/supabase-auth-kit-core": "^0.1.1"
   }
 }
