@@ -1,6 +1,6 @@
 {
   "name": "@sirhc77/supabase-auth-kit-fastify",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Fastify plugin for @sirhc77/supabase-auth-kit",
   "keywords": [
     "authn",
@@ -53,6 +53,6 @@
     "fastify-plugin": "^6.0.0"
   },
   "dependencies": {
-    "@sirhc77/supabase-auth-kit-core": "^0.1.0"
+    "@sirhc77/supabase-auth-kit-core": "^0.1.1"
   }
 }
