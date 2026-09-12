@@ -25,6 +25,15 @@
     "build": "tsc",
     "test": "vitest run"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/megafarad/supabase-auth-kit.git",
+    "directory": "packages/core"
+  },
+  "publishConfig": {
+    "provenance": true,
+    "access": "public"
+  },
   "dependencies": {
     "jose": "^6.2.10"
   },

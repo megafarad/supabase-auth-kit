@@ -21,6 +21,15 @@
   "bin": {
     "supabase-auth-kit": "./dist/install-migrations.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/megafarad/supabase-auth-kit.git",
+    "directory": "apps/installer"
+  },
+  "publishConfig": {
+    "provenance": true,
+    "access": "public"
+  },
   "devDependencies": {
     "@types/node": "^26.4.1"
   }

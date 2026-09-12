@@ -13,6 +13,9 @@
       "dependsOn": [
         "build"
       ],
+      "env": [
+        "AUTHZ_TEST_DATABASE_URL"
+      ],
       "outputs": []
     }
   }

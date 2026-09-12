@@ -22,7 +22,13 @@
     "test": "turbo run test",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
-    "changeset:publish": "changeset publish --no-git-tag --provenance"
+    "changeset": "changeset",
+    "changeset:version": "changeset version && npm install --package-lock-only --ignore-scripts",
+    "changeset:publish": "changeset publish --no-git-tag"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/megafarad/supabase-auth-kit.git"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",

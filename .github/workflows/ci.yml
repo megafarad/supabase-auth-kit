@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: GitHub Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The integration suites skip themselves when the database is unreachable, so without a
+      # real stack CI would go green having never exercised the SQL the whole model lives in.
+      - name: Start local Supabase stack
+        run: npx supabase start --workdir apps/installer -x studio,imgproxy,edge-runtime,logflare,vector
+
+      # Fail loudly here rather than letting the suites skip: a reachable database whose
+      # bootstrap migration has not run would still produce a green, meaningless test run.
+      - name: Verify the authz schema migrated
+        run: |
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 54322 -U postgres -d postgres \
+            -tAc "select count(*) from authz.tenants where parent_id is null" | grep -qx 1
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+        env:
+          AUTHZ_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+
+      - name: Supabase logs
+        if: failure()
+        run: npx supabase status --workdir apps/installer || true
