@@ -7,26 +7,28 @@ It checks the `authz` schema that the kit installs into your database, so instal
 ## Install
 
 ```bash
-npm install @sirhc77/supabase-auth-kit-express pg
+npm install @sirhc77/supabase-auth-kit-express @supabase/supabase-js
 ```
 
-`express` is a peer dependency (`^4.0.0 || ^5.2.1`). `pg` is only an example: the kit works with any Postgres driver you wrap in a query function. The package is ESM-only.
+`express` is a peer dependency (`^4.0.0 || ^5.2.1`). The kit reaches your database through a supabase-js client you pass in, or through any Postgres driver you wrap in a query function. The package is ESM-only.
 
 ## Quick start
 
 ```ts
 import express from "express";
-import pg from "pg";
+import { createClient } from "@supabase/supabase-js";
 import {
     createExpressAuthKit,
     getAuthContext,
     tenantFromParam,
 } from "@sirhc77/supabase-auth-kit-express";
 
-const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SECRET_KEY!, {
+    auth: { persistSession: false, autoRefreshToken: false },
+});
 
 const auth = createExpressAuthKit({
-    query: (text, params) => pool.query(text, [...params]).then(r => r.rows),
+    supabase,
     jwt: {
         jwksUrl: `${process.env.SUPABASE_URL}/auth/v1/.well-known/jwks.json`,
         issuer: `${process.env.SUPABASE_URL}/auth/v1`,
@@ -50,15 +52,29 @@ app.get("/t/:tenantId/roles", auth.requireScope("authz.roles.read"), async (req,
 app.use(auth.errorHandler());
 ```
 
-`DATABASE_URL` is your project's Postgres connection string, for the **`postgres`** role. You'll find it under *Connect* in the Supabase dashboard, and a local stack uses `postgresql://postgres:postgres@127.0.0.1:54322/postgres`. The Supabase service-role key won't work: the `authz` schema is private and can't be reached through the Supabase APIs.
+`SUPABASE_SECRET_KEY` is your project's **secret key** (`sb_secret_…`, or the legacy `service_role` key). It can act as any principal, so keep it on the server. The client also needs the `authz` schema exposed to the API: locally, add `"authz"` to `schemas` under `[api]` in `supabase/config.toml` and restart the stack; on a hosted project, add it to the exposed schemas in the dashboard's API settings. The kit's migrations already grant the secret key's role what it needs. **Don't grant anything in `authz` to `anon` or `authenticated`**, even though Supabase's guide to exposing a custom schema says to: that would let anyone holding your public key make themselves a platform administrator.
 
-That connection bypasses row-level security. The kit only ever calls `authz` functions through it, and those functions enforce the rules. Don't write to `authz` tables with it yourself.
+To use a direct Postgres connection instead, pass `query` in place of `supabase`:
+
+```ts
+import pg from "pg";
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+// ...
+    query: (text, params) => pool.query(text, [...params]).then(r => r.rows),
+```
+
+`DATABASE_URL` is the connection string for the **`postgres`** role, under *Connect* in the Supabase dashboard; a local stack uses `postgresql://postgres:postgres@127.0.0.1:54322/postgres`. That way needs no exposed schema.
+
+Either connection bypasses row-level security. The kit only ever calls `authz` functions through it, and those functions enforce the rules. Don't write to `authz` tables yourself.
 
 ## Options
 
 | Option | |
 | --- | --- |
-| `query` | **Required.** `(sql, params) => Promise<Row[]>`. Values must come back as native types (`pg` and `postgres.js` both return them) |
+| `supabase` | A supabase-js client holding the secret key. Pass this, `query` or `transport` |
+| `query` | `(sql, params) => Promise<Row[]>` on a `postgres` connection. Values must come back as native types (`pg` and `postgres.js` both return them) |
+| `transport` | Your own `AuthzTransport`, as exported by the core package |
 | `jwt.jwksUrl` | Supabase's JWKS endpoint, `<SUPABASE_URL>/auth/v1/.well-known/jwks.json` |
 | `jwt.issuer` | The expected `iss`: `<SUPABASE_URL>/auth/v1`. The issuer isn't checked when you omit it, so set it |
 | `jwt.audience` | The expected `aud`. Defaults to `authenticated` |
@@ -68,7 +84,7 @@ That connection bypasses row-level security. The kit only ever calls `authz` fun
 | `resolveTenant` | **Required.** Where each request names its tenant. See [Tenant resolution](#tenant-resolution) |
 | `apiKeyHeader` | The header carrying an API key. Defaults to `x-api-key` |
 
-You must pass either `jwt` or `verifyBearer`. With `jwt`, tokens are verified locally against a cached copy of the key set, so verifying a request doesn't call Supabase Auth.
+Pass exactly one of `supabase`, `query` or `transport`, and either `jwt` or `verifyBearer`. With `jwt`, tokens are verified locally against a cached copy of the key set, so verifying a request doesn't call Supabase Auth.
 
 With `postgres.js`, wrap the client like this: `query: (text, params) => sql.unsafe(text, params as never[])`.
 
@@ -130,7 +146,17 @@ Letting the client choose the tenant is safe: a tenant where the caller holds no
 | `credentialPresented` | Whether the request sent a credential at all |
 | `has(tenantId, scope)` | Whether the principal holds a scope. Answered from the same per-request cache the guards use |
 | `scopes(tenantId)` | Every scope the principal holds at the tenant |
-| `as` | The write API, acting as this principal. `null` when there's no principal |
+| `as` | The read and write APIs, acting as this principal. `null` when there's no principal |
+
+### Reads
+
+`as` also lists what the principal is allowed to see, for example to build a tenant switcher or a members page. Without the authority a list comes back empty rather than failing:
+
+```ts
+const { rows, nextCursor } = await getAuthContext(req).as!.listTenantBindings(tenantId, { limit: 50 });
+```
+
+`getTenant`, `listChildTenants`, `listMyBindings`, `listPrincipalBindings`, `listTenantBindings`, `listRoles`, `listRoleScopes`, `listScopes` and `listApiKeys` are covered in the [core package's README](https://www.npmjs.com/package/@sirhc77/supabase-auth-kit-core#reads), with the scope each one needs and how paging works.
 
 ### Writes
 
@@ -169,7 +195,7 @@ app.post(
 | `createApiKey(tenantId, label, expiresAt?)` | Returns the plaintext key. It's shown only this once |
 | `revokeApiKey(apiKeyId)` | |
 
-A refused write throws `AuthzDeniedError`. The message doesn't say why, so it can't reveal whether a role or tenant exists. `AuthzStateError` usually means the kit's migrations haven't been applied.
+A refused write throws `AuthzDeniedError`. The message doesn't say why, so it can't reveal whether a role or tenant exists. `AuthzStateError` usually means the kit's migrations haven't been applied, and `AuthzConfigError` means the connection can't reach `authz` at all: the wrong key, or the schema isn't exposed.
 
 For work outside a request, such as jobs or scripts, `auth.kit` exposes the underlying core API: `hasScope`, `effectiveScopes`, `principalForAuthUser`, `as(principalId)`, and so on.
 

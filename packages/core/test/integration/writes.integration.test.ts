@@ -1,38 +1,24 @@
 /**
- * The write API against a real local Supabase stack. Skipped when the database is unreachable.
+ * The write API against a real local Supabase stack, once per transport. Skipped when the stack
+ * is unreachable.
  *
  * These exist to prove two things the unit tests cannot: that the pre-bound actor reaches the
- * SQL functions in the right position, and that a guard's refusal surfaces as a typed
- * AuthzDeniedError rather than an opaque driver error.
+ * SQL functions under the right parameter name, and that a guard's refusal surfaces as a typed
+ * AuthzDeniedError rather than an opaque driver or PostgREST error.
  */
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { AuthzDeniedError, createAuthKit, type QueryFn } from "../../src/index.js";
+import { AuthzDeniedError, createAuthKit } from "../../src/index.js";
+import { ADMIN_ROLE, DB_URL, TENANT_ADMIN_ROLE, TRANSPORTS } from "./stack.js";
 
-const DB_URL =
-    process.env["AUTHZ_TEST_DATABASE_URL"] ??
-    "postgresql://postgres:postgres@127.0.0.1:54322/postgres";
+describe.each(TRANSPORTS)("write API against a live authz schema ($name)", transport => {
+    if (!transport.available) {
+        it.skip("needs a reachable local stack", () => {});
 
-const ADMIN_ROLE = "a0000000-0000-4000-8000-000000000002";
-const TENANT_ADMIN_ROLE = "a0000000-0000-4000-8000-000000000003";
-
-async function reachable(): Promise<boolean> {
-    const probe = new Client({ connectionString: DB_URL });
-
-    try {
-        await probe.connect();
-        await probe.end();
-
-        return true;
-    } catch {
-        return false;
+        return;
     }
-}
 
-const available = await reachable();
-
-describe.skipIf(!available)("write API against a live authz schema", () => {
     let client: Client;
     let kit: ReturnType<typeof createAuthKit>;
 
@@ -48,10 +34,10 @@ describe.skipIf(!available)("write API against a live authz schema", () => {
         client = new Client({ connectionString: DB_URL });
         await client.connect();
 
-        const query: QueryFn = (sql, params) =>
-            client.query(sql, params as unknown[]).then(r => r.rows);
-
-        kit = createAuthKit({ query, verifyBearer: async () => null });
+        kit = createAuthKit({
+            transport: transport.make(client),
+            verifyBearer: async () => null,
+        });
 
         const operatorUser = await one<string>(
             "select authz.provision_admin($1) as result",

@@ -1,6 +1,6 @@
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
-import { scalar, type QueryFn } from "./query.js";
+import type { AuthzTransport } from "./transport.js";
 import { isUuid } from "./uuid.js";
 
 export interface JwtOptions {
@@ -109,15 +109,13 @@ export function createBearerVerifier(options: JwtOptions): VerifyBearer {
  * error: someone who registers an address a retired identity still holds gets a confirmed
  * `auth.users` row and nothing in authz.
  */
-export function principalForAuthUser(
-    query: QueryFn,
+export async function principalForAuthUser(
+    transport: AuthzTransport,
     authUserId: string,
 ): Promise<string | null> {
-    return scalar<string>(
-        query,
-        "select authz.principal_for_auth_user($1) as result",
-        [authUserId],
-    );
+    return (await transport.scalar("principal_for_auth_user", {
+        p_auth_user_id: authUserId,
+    })) as string | null;
 }
 
 /**
@@ -127,25 +125,23 @@ export function principalForAuthUser(
  * `authz.verify_api_key` is VOLATILE: it writes `last_used_at`, so this costs one row-level
  * write per call. Call it at most once per request.
  */
-export function principalForApiKey(
-    query: QueryFn,
+export async function principalForApiKey(
+    transport: AuthzTransport,
     key: string,
 ): Promise<string | null> {
-    return scalar<string>(query, "select authz.verify_api_key($1) as result", [
-        key,
-    ]);
+    return (await transport.scalar("verify_api_key", { p_key: key })) as
+        | string
+        | null;
 }
 
 /** Whether a claimed, enabled user or a live API key sits behind a principal. */
 export async function principalIsActive(
-    query: QueryFn,
+    transport: AuthzTransport,
     principalId: string,
 ): Promise<boolean> {
     return (
-        (await scalar<boolean>(
-            query,
-            "select authz.principal_is_active($1) as result",
-            [principalId],
-        )) === true
+        (await transport.scalar("principal_is_active", {
+            p_principal_id: principalId,
+        })) === true
     );
 }

@@ -339,25 +339,36 @@ comment on function authz.effective_scope_defs(uuid) is
     'Scope definitions visible at a tenant. A scope crosses a boundary only by being attached to a crossing role.';
 
 
--- Bindings in force for a principal at a tenant.
-create or replace function authz.effective_bindings(p_principal_id uuid, p_tenant_id uuid)
-    returns table (binding_id uuid, role_id uuid, source_tenant_id uuid, depth integer)
+-- Every binding in force at a tenant, for any principal. The one place grants are read:
+-- effective_bindings narrows it to a principal, and list_tenant_bindings lists it.
+--
+-- Deliberately NOT security definer and with no SET clause, which is the opposite of every
+-- other function here. Those two attributes are what stop Postgres inlining a SQL function,
+-- and inlining is what lets the planner push effective_bindings' principal filter down into
+-- this query. Measured with 20k bindings at one tenant: inlined, has_scope costs the same as
+-- when this query lived inside effective_bindings; as an opaque security definer call it was
+-- 35x slower, because every check materialised the whole tenant's bindings first.
+--
+-- That is safe only because nothing but the owner can reach it. EXECUTE is revoked from
+-- everyone, so it runs inside the security definer functions that call it, as the owner and
+-- under their empty search_path. Every reference in it is schema-qualified regardless. Never
+-- grant it: as an invoker function it would run under the caller's RLS and search_path.
+create or replace function authz.bindings_in_force(p_tenant_id uuid)
+    returns table (binding_id uuid, principal_id uuid, role_id uuid, source_tenant_id uuid,
+                   depth integer)
     language sql
     stable
-    security definer
-    set search_path = ''
 as $$
 -- No name-keyed merge here: bindings never shadow. A principal can hold master's admin and
 -- a child's admin at once and both are returned, deduplicated only by binding row.
-select rb.id, rb.role_id, rb.tenant_id, c.depth
+select rb.id, rb.principal_id, rb.role_id, rb.tenant_id, c.depth
   from authz.tenant_chain(p_tenant_id) c
   join authz.role_bindings rb on rb.tenant_id = c.tenant_id
   join authz.roles r on r.id = rb.role_id
   join authz.principals p on p.id = rb.principal_id
   left join authz.users u on u.id = p.user_id
   left join authz.api_keys k on k.id = p.api_key_id
- where rb.principal_id = p_principal_id
-   and (not c.crossed or r.crosses_boundary)
+ where (not c.crossed or r.crosses_boundary)
    -- Soft deletion is never implicit: every revocable timestamp is filtered here, because
    -- this is the one place grants are read.
    and rb.revoked_at is null
@@ -370,6 +381,23 @@ select rb.id, rb.role_id, rb.tenant_id, c.depth
    and (p.kind <> 'api_key'
         or (k.revoked_at is null
             and (k.expires_at is null or k.expires_at > now())));
+$$;
+
+comment on function authz.bindings_in_force(uuid) is
+    'Live role bindings in force at a tenant for every principal. Invoker and inlinable by design; internal only, never grant it.';
+
+
+-- Bindings in force for a principal at a tenant.
+create or replace function authz.effective_bindings(p_principal_id uuid, p_tenant_id uuid)
+    returns table (binding_id uuid, role_id uuid, source_tenant_id uuid, depth integer)
+    language sql
+    stable
+    security definer
+    set search_path = ''
+as $$
+select b.binding_id, b.role_id, b.source_tenant_id, b.depth
+  from authz.bindings_in_force(p_tenant_id) b
+ where b.principal_id = p_principal_id;
 $$;
 
 comment on function authz.effective_bindings(uuid, uuid) is
@@ -1401,3 +1429,369 @@ $$;
 
 comment on function authz.role_tenant_id(uuid) is
     'The tenant owning a role. Lets the role_scopes policy resolve a tenant without reading authz.roles under RLS.';
+
+
+-- ---------------------------------------------------------------------------------------
+-- Reads
+--
+-- The sanctioned read path for an application, shaped like the writes: the actor is passed
+-- explicitly, and each function is security definer so it reads past RLS and carries its own
+-- rule. They answer the same visibility questions as the dormant policies in 002, but per
+-- tenant rather than per table row, so a few of them resolve through the ancestor chain where
+-- a policy on the raw row could not.
+--
+-- Refusal is filtering, never an exception. An actor without authority gets zero rows --
+-- exactly what RLS would return -- so no read can be used to probe whether a tenant, role or
+-- binding exists.
+--
+-- Lists page by keyset. PostgREST applies max_rows (1000 by default) to RPC results too and
+-- truncates silently, so an unpaged list would quietly lose rows once it grew. Each row
+-- carries page_cursor, which is the row's id followed by its sort key; pass the last row's
+-- page_cursor back as p_after. An id is always 36 characters, which is what lets the two
+-- halves be split without a delimiter that a name could contain. p_limit is clamped to
+-- [1, 1000] and defaults to 100.
+-- ---------------------------------------------------------------------------------------
+
+-- A tenant, if the actor holds authz.tenants.read there.
+create or replace function authz.get_tenant(p_actor_principal_id uuid, p_tenant_id uuid)
+    returns table (tenant_id uuid, parent_id uuid, name text, inherit boolean,
+                   created_at timestamptz, updated_at timestamptz)
+    language sql
+    stable
+    security definer
+    set search_path = ''
+as $$
+select t.id, t.parent_id, t.name, t.inherit, t.created_at, t.updated_at
+  from authz.tenants t
+ where t.id = p_tenant_id
+   and authz.has_scope(p_actor_principal_id, t.id, 'authz.tenants.read');
+$$;
+
+comment on function authz.get_tenant(uuid, uuid) is
+    'A tenant, or no row unless the actor holds authz.tenants.read at it.';
+
+
+-- The children of a tenant that the actor holds authz.tenants.read at, by name.
+--
+-- The authority check has a shortcut, and it is what keeps listing the master's workspaces
+-- from costing one ancestor walk per workspace. A child that inherits receives every binding
+-- in force at its parent, so whatever the actor holds at the parent they also hold at such a
+-- child: authority at the parent, checked once, answers for every inheriting child. Only a
+-- child with inherit = false needs its own check, because the cut may filter the actor out.
+-- The shortcut can only ever admit a row has_scope would also admit.
+create or replace function authz.list_child_tenants(p_actor_principal_id uuid,
+                                                    p_parent_id uuid,
+                                                    p_limit integer default 100,
+                                                    p_after text default null)
+    returns table (tenant_id uuid, parent_id uuid, name text, inherit boolean,
+                   created_at timestamptz, updated_at timestamptz, page_cursor text)
+    language sql
+    stable
+    security definer
+    set search_path = ''
+as $$
+select t.id, t.parent_id, t.name, t.inherit, t.created_at, t.updated_at,
+       t.id::text || t.name
+  from authz.tenants t
+ where t.parent_id = p_parent_id
+   and case
+           when t.inherit
+                and (select authz.has_scope(p_actor_principal_id, p_parent_id,
+                                            'authz.tenants.read'))
+               then true
+           else authz.has_scope(p_actor_principal_id, t.id, 'authz.tenants.read')
+       end
+   and (p_after is null
+        or (t.name, t.id) > (substr(p_after, 37), substr(p_after, 1, 36)::uuid))
+ order by t.name, t.id
+ limit least(greatest(coalesce(p_limit, 100), 1), 1000);
+$$;
+
+comment on function authz.list_child_tenants(uuid, uuid, integer, text) is
+    'Child tenants of a parent that the actor holds authz.tenants.read at, ordered by name and paged by keyset.';
+
+
+-- The live bindings one principal holds, across every tenant, by tenant name.
+--
+-- Your own bindings are always visible, as in the role_bindings policy -- this is how a
+-- person finds out which tenants they belong to. Anyone else's need authz.bindings.read
+-- where the binding was made.
+--
+-- Membership reveals names: a binding of your own shows its tenant's and role's names even
+-- without authz.tenants.read or authz.roles.read, because a tenant switcher that could not
+-- name your own tenants would be useless. For another principal's bindings each name follows
+-- the ordinary read scope at that tenant and is null without it.
+create or replace function authz.list_principal_bindings(p_actor_principal_id uuid,
+                                                         p_principal_id uuid,
+                                                         p_limit integer default 100,
+                                                         p_after text default null)
+    returns table (binding_id uuid, principal_id uuid, tenant_id uuid, tenant_name text,
+                   role_id uuid, role_name text, granted_by_principal_id uuid,
+                   granted_at timestamptz, expires_at timestamptz, page_cursor text)
+    language sql
+    stable
+    security definer
+    set search_path = ''
+as $$
+with visible as (
+    select rb.id as binding_id, rb.principal_id, rb.tenant_id,
+           case
+               when p_actor_principal_id = p_principal_id then t.name
+               when authz.has_scope(p_actor_principal_id, rb.tenant_id,
+                                    'authz.tenants.read') then t.name
+           end as tenant_name,
+           rb.role_id,
+           case
+               when p_actor_principal_id = p_principal_id then r.name
+               when authz.has_scope(p_actor_principal_id, rb.tenant_id,
+                                    'authz.roles.read') then r.name
+           end as role_name,
+           rb.granted_by_principal_id, rb.granted_at, rb.expires_at
+      from authz.role_bindings rb
+      join authz.tenants t on t.id = rb.tenant_id
+      join authz.roles r on r.id = rb.role_id
+     where rb.principal_id = p_principal_id
+       and (p_actor_principal_id = p_principal_id
+            or authz.has_scope(p_actor_principal_id, rb.tenant_id, 'authz.bindings.read'))
+       -- Liveness comes from bindings_in_force rather than being restated. At a binding's own
+       -- tenant nothing is crossed, so all that filter leaves is revoked, expired, disabled.
+       and exists (
+           select 1
+             from authz.bindings_in_force(rb.tenant_id) b
+            where b.binding_id = rb.id
+       )
+)
+select v.*, v.binding_id::text || coalesce(v.tenant_name, '')
+  from visible v
+ where p_after is null
+    or (coalesce(v.tenant_name, ''), v.binding_id)
+       > (substr(p_after, 37), substr(p_after, 1, 36)::uuid)
+ order by coalesce(v.tenant_name, ''), v.binding_id
+ limit least(greatest(coalesce(p_limit, 100), 1), 1000);
+$$;
+
+comment on function authz.list_principal_bindings(uuid, uuid, integer, text) is
+    'Live bindings held by a principal: all of them for the principal itself, otherwise those at tenants where the actor holds authz.bindings.read.';
+
+
+-- Who is a member of a tenant: the live bindings there, by email or API key label.
+--
+-- By default only bindings made AT the tenant. p_include_inherited adds every binding in force
+-- there from above -- which, for any tenant under the master, includes the platform operators.
+-- Each binding is shown where the actor holds authz.bindings.read at the tenant it was made,
+-- or where it is the actor's own -- exactly the role_bindings policy -- so a tenant admin
+-- asking for inherited bindings sees none from tenants they cannot read, and a plain member
+-- sees themselves and nobody else.
+--
+-- Unclaimed identities are listed, with claimed = false: they are pending invites, and
+-- bindings_in_force admits them deliberately. Disabled and deleted identities are not.
+--
+-- The detail columns are null without the matching authority where the binding was made:
+-- email needs authz.users.read, role_name authz.roles.read, and an API key's label needs
+-- authz.api_keys.read at the key's own tenant. Your own row always shows your email and role,
+-- as in list_principal_bindings. That rule for email is narrower than can_read_user, which
+-- would also admit someone readable through some other tenant. The narrower rule is checked
+-- once per tenant in the chain; can_read_user costs a query per row, and the sort would force
+-- it onto every row of the tenant, not just the page.
+create or replace function authz.list_tenant_bindings(p_actor_principal_id uuid,
+                                                      p_tenant_id uuid,
+                                                      p_include_inherited boolean default false,
+                                                      p_limit integer default 100,
+                                                      p_after text default null)
+    returns table (binding_id uuid, principal_id uuid, principal_kind text,
+                   user_id uuid, email text, claimed boolean,
+                   api_key_id uuid, api_key_label text,
+                   role_id uuid, role_name text,
+                   source_tenant_id uuid, inherited boolean,
+                   granted_by_principal_id uuid, granted_at timestamptz,
+                   expires_at timestamptz, page_cursor text)
+    language sql
+    stable
+    security definer
+    set search_path = ''
+as $$
+-- MATERIALIZED is load-bearing. A CTE referenced once is otherwise inlined into the join, and
+-- then these has_scope calls run once per binding instead of once per tenant in the chain:
+-- measured at 43 seconds for one page of a tenant with 20k members, against milliseconds here.
+with sources as materialized (
+    select c.tenant_id,
+           authz.has_scope(p_actor_principal_id, c.tenant_id, 'authz.bindings.read') as bindings_read,
+           authz.has_scope(p_actor_principal_id, c.tenant_id, 'authz.users.read') as users_read,
+           authz.has_scope(p_actor_principal_id, c.tenant_id, 'authz.roles.read') as roles_read
+      from authz.tenant_chain(p_tenant_id) c
+     where c.depth = 0 or coalesce(p_include_inherited, false)
+),
+visible as (
+    select b.binding_id, b.principal_id, p.kind::text as principal_kind,
+           p.user_id,
+           case when s.users_read or b.principal_id = p_actor_principal_id
+                then u.email end as email,
+           case when p.kind = 'user' then u.auth_user_id is not null end as claimed,
+           p.api_key_id,
+           case
+               when k.id is null then null
+               when authz.has_scope(p_actor_principal_id, k.tenant_id,
+                                    'authz.api_keys.read') then k.label
+           end as api_key_label,
+           b.role_id,
+           case when s.roles_read or b.principal_id = p_actor_principal_id
+                then r.name end as role_name,
+           b.source_tenant_id,
+           b.depth > 0 as inherited,
+           rb.granted_by_principal_id, rb.granted_at, rb.expires_at
+      from authz.bindings_in_force(p_tenant_id) b
+      join sources s on s.tenant_id = b.source_tenant_id
+      join authz.role_bindings rb on rb.id = b.binding_id
+      join authz.roles r on r.id = b.role_id
+      join authz.principals p on p.id = b.principal_id
+      left join authz.users u on u.id = p.user_id
+      left join authz.api_keys k on k.id = p.api_key_id
+     where s.bindings_read or b.principal_id = p_actor_principal_id
+)
+select v.*, v.binding_id::text || coalesce(v.email, v.api_key_label, '')
+  from visible v
+ where p_after is null
+    or (coalesce(v.email, v.api_key_label, ''), v.binding_id)
+       > (substr(p_after, 37), substr(p_after, 1, 36)::uuid)
+ order by coalesce(v.email, v.api_key_label, ''), v.binding_id
+ limit least(greatest(coalesce(p_limit, 100), 1), 1000);
+$$;
+
+comment on function authz.list_tenant_bindings(uuid, uuid, boolean, integer, text) is
+    'Live bindings at a tenant -- its members -- that are the actor''s own or were made where the actor holds authz.bindings.read. Optionally includes bindings inherited from above.';
+
+
+-- The roles in effect at a tenant, after shadowing, if the actor holds authz.roles.read there.
+--
+-- Resolved rather than raw: a tenant sees the master's built-ins it inherits, flagged
+-- inherited, and not the rows a nearer definition shadows. The roles policy gates each row on
+-- its owning tenant instead, which would hide every inherited role from a tenant admin -- the
+-- one thing a role picker has to show.
+create or replace function authz.list_roles(p_actor_principal_id uuid,
+                                            p_tenant_id uuid,
+                                            p_limit integer default 100,
+                                            p_after text default null)
+    returns table (role_id uuid, name text, description text, crosses_boundary boolean,
+                   source_tenant_id uuid, inherited boolean, page_cursor text)
+    language sql
+    stable
+    security definer
+    set search_path = ''
+as $$
+select er.role_id, er.name, r.description, er.crosses_boundary, er.source_tenant_id,
+       er.depth > 0, er.role_id::text || er.name
+  from authz.effective_roles(p_tenant_id) er
+  join authz.roles r on r.id = er.role_id
+ where authz.has_scope(p_actor_principal_id, p_tenant_id, 'authz.roles.read')
+   and (p_after is null
+        or (er.name, er.role_id) > (substr(p_after, 37), substr(p_after, 1, 36)::uuid))
+ order by er.name, er.role_id
+ limit least(greatest(coalesce(p_limit, 100), 1), 1000);
+$$;
+
+comment on function authz.list_roles(uuid, uuid, integer, text) is
+    'Roles in effect at a tenant after shadowing, if the actor holds authz.roles.read there.';
+
+
+-- The scopes a role confers, viewed from a tenant where the actor holds authz.roles.read.
+--
+-- Anchored on a tenant rather than on the role's owner for the same reason as list_roles: a
+-- tenant admin must be able to see what the inherited tenant_admin role contains. The role has
+-- to be in effect at that tenant, or be the role of a binding in force there -- the second
+-- clause covers a binding to a role a nearer definition has since shadowed, which
+-- list_tenant_bindings can still show.
+--
+-- These are the scopes attached to this role row, which is what a binding to it confers --
+-- never the scopes of whatever its name resolves to elsewhere.
+create or replace function authz.list_role_scopes(p_actor_principal_id uuid,
+                                                  p_tenant_id uuid,
+                                                  p_role_id uuid,
+                                                  p_limit integer default 100,
+                                                  p_after text default null)
+    returns table (scope_id uuid, name text, description text, source_tenant_id uuid,
+                   page_cursor text)
+    language sql
+    stable
+    security definer
+    set search_path = ''
+as $$
+select s.id, s.name, s.description, s.tenant_id, s.id::text || s.name
+  from authz.role_scopes rs
+  join authz.scopes s on s.id = rs.scope_id
+ where rs.role_id = p_role_id
+   and authz.has_scope(p_actor_principal_id, p_tenant_id, 'authz.roles.read')
+   and (exists (select 1 from authz.effective_roles(p_tenant_id) er
+                 where er.role_id = p_role_id)
+        or exists (select 1 from authz.bindings_in_force(p_tenant_id) b
+                    where b.role_id = p_role_id))
+   and (p_after is null
+        or (s.name, s.id) > (substr(p_after, 37), substr(p_after, 1, 36)::uuid))
+ order by s.name, s.id
+ limit least(greatest(coalesce(p_limit, 100), 1), 1000);
+$$;
+
+comment on function authz.list_role_scopes(uuid, uuid, uuid, integer, text) is
+    'Scopes attached to a role in effect at a tenant, if the actor holds authz.roles.read there.';
+
+
+-- The scope definitions in effect at a tenant, after shadowing, if the actor holds
+-- authz.scopes.read there. Resolved for the same reason as list_roles.
+create or replace function authz.list_scopes(p_actor_principal_id uuid,
+                                             p_tenant_id uuid,
+                                             p_limit integer default 100,
+                                             p_after text default null)
+    returns table (scope_id uuid, name text, description text, source_tenant_id uuid,
+                   inherited boolean, page_cursor text)
+    language sql
+    stable
+    security definer
+    set search_path = ''
+as $$
+select sd.scope_id, sd.name, s.description, sd.source_tenant_id, sd.depth > 0,
+       sd.scope_id::text || sd.name
+  from authz.effective_scope_defs(p_tenant_id) sd
+  join authz.scopes s on s.id = sd.scope_id
+ where authz.has_scope(p_actor_principal_id, p_tenant_id, 'authz.scopes.read')
+   and (p_after is null
+        or (sd.name, sd.scope_id) > (substr(p_after, 37), substr(p_after, 1, 36)::uuid))
+ order by sd.name, sd.scope_id
+ limit least(greatest(coalesce(p_limit, 100), 1), 1000);
+$$;
+
+comment on function authz.list_scopes(uuid, uuid, integer, text) is
+    'Scope definitions in effect at a tenant after shadowing, if the actor holds authz.scopes.read there.';
+
+
+-- The API keys issued at a tenant, revoked ones included, by label.
+--
+-- key_hash is never returned. It is a SHA-256 and not the key, but nothing needs it outside
+-- verify_api_key, and a read path that cannot return it cannot leak it. principal_id is what
+-- grant_role and list_principal_bindings take for a key.
+create or replace function authz.list_api_keys(p_actor_principal_id uuid,
+                                               p_tenant_id uuid,
+                                               p_limit integer default 100,
+                                               p_after text default null)
+    returns table (api_key_id uuid, principal_id uuid, key_prefix text, label text,
+                   tenant_id uuid, created_by_user_id uuid, last_used_at timestamptz,
+                   expires_at timestamptz, revoked_at timestamptz, created_at timestamptz,
+                   page_cursor text)
+    language sql
+    stable
+    security definer
+    set search_path = ''
+as $$
+select k.id, p.id, k.key_prefix, k.label, k.tenant_id, k.created_by_user_id,
+       k.last_used_at, k.expires_at, k.revoked_at, k.created_at,
+       k.id::text || k.label
+  from authz.api_keys k
+  join authz.principals p on p.api_key_id = k.id
+ where k.tenant_id = p_tenant_id
+   and authz.has_scope(p_actor_principal_id, p_tenant_id, 'authz.api_keys.read')
+   and (p_after is null
+        or (k.label, k.id) > (substr(p_after, 37), substr(p_after, 1, 36)::uuid))
+ order by k.label, k.id
+ limit least(greatest(coalesce(p_limit, 100), 1), 1000);
+$$;
+
+comment on function authz.list_api_keys(uuid, uuid, integer, text) is
+    'API keys issued at a tenant, without key_hash, if the actor holds authz.api_keys.read there.';

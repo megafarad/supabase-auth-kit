@@ -43,6 +43,26 @@ jobs:
           PGPASSWORD=postgres psql -h 127.0.0.1 -p 54322 -U postgres -d postgres \
             -tAc "select count(*) from authz.tenants where parent_id is null" | grep -qx 1
 
+      # The local stack's keys, for the supabase-js suites. Read from the stack rather than written
+      # here, so secret scanning never has to judge whether a key is only a local one.
+      - name: Export the local stack's API keys
+        run: |
+          status=$(npx supabase status --workdir apps/installer -o json | sed -n '/^{/,$p')
+          secret=$(echo "$status" | jq -r .SECRET_KEY)
+          publishable=$(echo "$status" | jq -r .PUBLISHABLE_KEY)
+          echo "::add-mask::$secret"
+          echo "AUTHZ_TEST_SUPABASE_SECRET_KEY=$secret" >> "$GITHUB_ENV"
+          echo "AUTHZ_TEST_SUPABASE_PUBLISHABLE_KEY=$publishable" >> "$GITHUB_ENV"
+
+      # Likewise for the supabase-js transport, whose suites skip when the API is unreachable or
+      # does not expose authz.
+      - name: Verify authz is callable through the API
+        run: |
+          curl -fsS -X POST http://127.0.0.1:54321/rest/v1/rpc/has_scope \
+            -H "apikey: $AUTHZ_TEST_SUPABASE_SECRET_KEY" \
+            -H "Content-Profile: authz" -H "Content-Type: application/json" \
+            -d '{"p_principal_id":null,"p_tenant_id":null,"p_scope":"ci"}' | grep -qx false
+
       - name: Build
         run: npm run build
 
@@ -50,6 +70,7 @@ jobs:
         run: npm test
         env:
           AUTHZ_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+          AUTHZ_TEST_SUPABASE_URL: http://127.0.0.1:54321
 
       - name: Supabase logs
         if: failure()

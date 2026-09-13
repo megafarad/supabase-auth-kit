@@ -1,39 +1,25 @@
 /**
- * Runs against a real local Supabase stack (`npx supabase start` in apps/installer).
+ * Runs against a real local Supabase stack (`npx supabase start` in apps/installer), once per
+ * transport. Fixtures are created over a direct connection either way.
  *
- * Skipped when the database is unreachable, so `npm run test` stays green without Docker. The
+ * Skipped when the stack is unreachable, so `npm run test` stays green without Docker. The
  * point of these is the seam the unit tests cannot reach: that the TypeScript short circuits
  * agree with what SQL actually answers.
  */
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { createAuthKit, type QueryFn } from "../../src/index.js";
+import { createAuthKit } from "../../src/index.js";
+import { DB_URL, TENANT_ADMIN_ROLE, TRANSPORTS } from "./stack.js";
 
-const DB_URL =
-    process.env["AUTHZ_TEST_DATABASE_URL"] ??
-    "postgresql://postgres:postgres@127.0.0.1:54322/postgres";
+describe.each(TRANSPORTS)("core against a live authz schema ($name)", transport => {
+    if (!transport.available) {
+        it.skip("needs a reachable local stack", () => {});
 
-const TENANT_ADMIN_ROLE = "a0000000-0000-4000-8000-000000000003";
-
-async function reachable(): Promise<boolean> {
-    const probe = new Client({ connectionString: DB_URL });
-
-    try {
-        await probe.connect();
-        await probe.end();
-
-        return true;
-    } catch {
-        return false;
+        return;
     }
-}
 
-const available = await reachable();
-
-describe.skipIf(!available)("core against a live authz schema", () => {
     let client: Client;
-    let query: QueryFn;
     let kit: ReturnType<typeof createAuthKit>;
 
     const suffix = Math.random().toString(36).slice(2, 10);
@@ -47,11 +33,11 @@ describe.skipIf(!available)("core against a live authz schema", () => {
         client = new Client({ connectionString: DB_URL });
         await client.connect();
 
-        query = (sql, params) =>
-            client.query(sql, params as unknown[]).then(r => r.rows);
-
         // verifyBearer is never exercised here; the identity paths under test are the SQL ones.
-        kit = createAuthKit({ query, verifyBearer: async () => null });
+        kit = createAuthKit({
+            transport: transport.make(client),
+            verifyBearer: async () => null,
+        });
 
         const operator = await one<string>(
             "select authz.provision_admin($1) as result",

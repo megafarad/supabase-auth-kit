@@ -1,5 +1,4 @@
-import type { AuthKit, PrincipalKind, ResolvedPrincipal } from "./index.js";
-import type { WriteApi } from "./writes.js";
+import type { ActorApi, AuthKit, PrincipalKind, ResolvedPrincipal } from "./index.js";
 
 /** What a framework binding attaches to a request once its credentials are resolved. */
 export interface AuthzContext {
@@ -11,12 +10,13 @@ export interface AuthzContext {
     scopes(tenantId: string): Promise<ReadonlySet<string>>;
     has(tenantId: string, scope: string): Promise<boolean>;
     /**
-     * The write API with this request's principal pre-bound, or null when there is no principal.
+     * The read and write APIs with this request's principal pre-bound, or null when there is no
+     * principal.
      *
      * Null rather than a throwing stub so the type system carries the rule: you have to be
-     * somebody before you can write, and there is no actor to pass if you are not.
+     * somebody before you can read or write, and there is no actor to pass if you are not.
      */
-    readonly as: WriteApi | null;
+    readonly as: ActorApi | null;
 }
 
 /**

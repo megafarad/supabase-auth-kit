@@ -150,6 +150,25 @@ async function main() {
             `Skipped ${skipped} migration(s) already present.`,
         );
     }
+
+    printExposureNotice();
+}
+
+/**
+ * The one piece of setup a migration cannot do. Printed rather than automated because exposed
+ * schemas are project configuration the consumer owns -- and because the obvious way to do it,
+ * Supabase's guide for custom schemas, grants every routine to anon and authenticated, which
+ * here would hand the public key `provision_admin`.
+ */
+function printExposureNotice(): void {
+    console.log(`
+To call the kit with supabase-js and your secret key, expose the authz schema:
+  local:   add "authz" to [api] schemas in supabase/config.toml, then supabase stop && supabase start
+  hosted:  add authz to the exposed schemas in the dashboard's API settings
+
+The migrations already grant service_role exactly what it needs. Do NOT grant anything in
+authz to anon or authenticated -- not even by following Supabase's guide for custom schemas.
+A direct Postgres connection as postgres needs none of this.`);
 }
 
 main().catch(error => {

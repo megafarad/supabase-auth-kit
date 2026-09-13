@@ -12,7 +12,7 @@ Express binding over `@sirhc77/supabase-auth-kit-core`. Thin by design: every au
 
 ```ts
 const auth = createExpressAuthKit({
-    query,                                     // BYO: (sql, params) => Promise<Row[]>
+    supabase,                                  // secret-key client; or query: (sql, params) => Promise<Row[]>
     jwt: { jwksUrl: `${SUPABASE_URL}/auth/v1/.well-known/jwks.json` },
     resolveTenant: tenantFromParam("tenantId"),
 });
@@ -24,8 +24,8 @@ app.use(auth.errorHandler());                  // opt-in
 
 ## The four rules from the model, as they land here
 
-- **The connection bypasses RLS.** The policies in `002_auth_kit_policies.sql` are dormant under posture A and will not catch a mistake here; the `SECURITY DEFINER` functions are the enforcement path. Note the connection is the **`postgres` owner** connection string — `service_role` is `NOLOGIN` in Supabase and only reaches tables through PostgREST, which does not expose `authz`.
-- **Resolve the actor, then pass it explicitly.** `req.authKit.as` is the write API with this request's principal pre-bound, and it is `null` when there is no principal — so the type system carries the rule that you must be somebody before you can write.
+- **The connection bypasses RLS.** The policies in `002_auth_kit_policies.sql` are dormant under posture A and will not catch a mistake here; the `SECURITY DEFINER` functions are the enforcement path. The connection is either the **`postgres` owner** connection string (`query`) or a supabase-js client holding the **secret key** (`supabase`) — see the transports in `packages/core/CLAUDE.md`. Options pass straight through to core's `createAuthKit`, so this package has no opinion on which.
+- **Resolve the actor, then pass it explicitly.** `req.authKit.as` is the read and write API with this request's principal pre-bound, and it is `null` when there is no principal — so the type system carries the rule that you must be somebody before you can read or write.
 - **No identity is zero scopes.** See below; this is the crux.
 - **Authorization is per (principal, tenant, scope)**, and scope names are SQL identifiers used verbatim.
 

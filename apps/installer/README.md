@@ -38,6 +38,17 @@ npx supabase db push        # linked hosted project
 
 Each copy is named `<timestamp>_supabase_auth_<original name>.sql`. The timestamp uses Supabase's own `YYYYMMDDHHMMSS` format and is always later than your newest existing migration, so the kit's migrations apply after yours. The installer uses the `_supabase_auth_` marker to recognise migrations it has already installed, so running it twice does nothing the second time.
 
+### Expose `authz` for supabase-js
+
+The adapters can reach the kit through a supabase-js client holding your secret key, or through a direct Postgres connection. For supabase-js, add `authz` to the API's exposed schemas:
+
+- **Local stack:** add `"authz"` to `schemas` under `[api]` in `supabase/config.toml`, then run `npx supabase stop` and `npx supabase start`.
+- **Hosted project:** add `authz` to the exposed schemas in the dashboard's API settings.
+
+**Don't grant anything in `authz` yourself.** The migrations already give `service_role`, the role behind the secret key, exactly the functions the adapters call. Supabase's guide to exposing a custom schema tells you to grant its routines to `anon` and `authenticated`; doing that here would let anyone holding your public key call `provision_admin` and make themselves a platform administrator. See [Access posture](#access-posture).
+
+A direct Postgres connection needs none of this.
+
 ### Upgrading
 
 Upgrade the package and run the installer again. It copies only the migrations your project doesn't have yet. Don't edit an installed migration: the next upgrade builds on it as shipped.
@@ -54,7 +65,7 @@ This creates an identity for that address and grants it the `admin` role at the 
 
 > **Accounts created before the kit was installed.** The trigger fires only when an account is created, or its email changes or is confirmed. A person who was already signed up and confirmed before you installed the kit won't be linked automatically, and `provision_admin` alone won't link them. Run `select authz.reclaim_identity('you@example.com');` after `provision_admin` to link the existing account.
 
-`provision_admin` has no authorization check of its own, so it can't be called through the adapters and isn't exposed to any API role.
+`provision_admin` has no authorization check of its own, so it can't be called through the adapters and isn't granted to any API role, not even the secret key's.
 
 ## The model
 
@@ -115,23 +126,38 @@ Every mutating function takes the acting principal as its first argument and ref
 
 ## Access posture
 
-The `authz` schema is private by design:
+Only your server can reach the `authz` schema:
 
-- It's absent from the PostgREST `[api] schemas`, so nothing in it is reachable through the Supabase REST or GraphQL APIs.
-- Nothing is granted to `anon` or `authenticated`, and `PUBLIC EXECUTE` is revoked from every function.
+- Nothing is granted to `anon` or `authenticated`, so the publishable and anon keys can't reach anything in it, even with the schema exposed. `PUBLIC EXECUTE` is revoked from every function.
+- `service_role`, the role behind your secret key, may call exactly the functions the adapters use, and nothing else. It can't read the tables directly, and it can't call the operator tools below.
 - Row-level security is enabled on every table, with read-only policies. Those policies are defence in depth: no role they govern can currently reach the tables.
 
-Your server reaches the schema through an adapter, on a direct Postgres connection as the `postgres` role. That connection bypasses row-level security, so the SQL functions are what enforce the rules. **Don't write to `authz` tables directly.** Go through the functions, which the adapters expose as a typed write API. Don't add `authz` to your exposed API schemas or grant it to API roles either: that is a different security posture, and the kit isn't built for it yet.
+Your server reaches the schema through an adapter, either with a supabase-js client holding the secret key or on a direct Postgres connection as the `postgres` role. Neither is subject to row-level security, so the SQL functions are what enforce the rules. **Don't write to `authz` tables directly.** Go through the functions, which the adapters expose as typed read and write APIs.
+
+**Never grant anything in `authz` to `anon` or `authenticated`.** Browsers calling the kit directly is a different security posture that the kit isn't built for yet, and granting those roles the existing functions would let any caller act as any principal.
 
 ## SQL function reference
 
-Reads. These are the building blocks the adapters use, and you can call them yourself from a `postgres` connection:
+Reads for your application. Each takes the acting principal first and returns only what that principal may see, so someone without the authority gets no rows rather than an error. Lists take `limit` (default 100, at most 1000) and `after`, a cursor: pass the last row's `page_cursor` to get the next page. The adapters expose these as `listTenantBindings` and so on:
+
+| Function | Returns |
+| --- | --- |
+| `get_tenant(actor, tenant)` | The tenant, with `authz.tenants.read` there |
+| `list_child_tenants(actor, parent, limit, after)` | Children the actor may read, by name |
+| `list_principal_bindings(actor, principal, limit, after)` | A principal's live bindings. Everything, when the principal is the actor |
+| `list_tenant_bindings(actor, tenant, include_inherited, limit, after)` | A tenant's members, including pending invites. `include_inherited` adds bindings made higher up the tree |
+| `list_roles(actor, tenant, limit, after)` / `list_scopes(...)` | The roles or scopes in effect at the tenant, after shadowing |
+| `list_role_scopes(actor, tenant, role, limit, after)` | The scopes a role in effect at the tenant confers |
+| `list_api_keys(actor, tenant, limit, after)` | Keys issued at the tenant. Never the key hash |
+
+Building blocks. The functions above and the adapters' checks are built on these. You can call them yourself from a `postgres` connection, but they aren't granted to any API role:
 
 | Function | Returns |
 | --- | --- |
 | `authz.has_scope(principal, tenant, scope)` | Whether the principal holds the scope at the tenant |
 | `authz.effective_scopes(principal, tenant)` | Every scope name the principal holds there |
 | `authz.effective_bindings(principal, tenant)` | The live bindings that apply there, wherever they were issued |
+| `authz.bindings_in_force(tenant)` | Every principal's live bindings that apply there. Internal: it can't be granted safely |
 | `authz.effective_roles(tenant)` | The role definitions visible at the tenant, after shadowing |
 | `authz.effective_scope_defs(tenant)` | The scope definitions visible at the tenant |
 | `authz.tenant_chain(tenant)` | The ancestor chain, with a flag marking rows beyond a cut |
@@ -157,7 +183,7 @@ Writes. Each function takes the acting principal first, and the adapters bind it
 
 `create_workspace` is the only write with no scope check. It requires only an active principal, so anyone who has signed up can call it. Decide whether to expose it for open signup, gate it behind a plan or an invite, or leave it to an operator. Rate limiting it is up to you.
 
-Operator tools. Run these from the SQL editor only; the adapters never expose them:
+Operator tools. Run these from the SQL editor only. The adapters never expose them, and no API role can call them:
 
 | Function | Does |
 | --- | --- |

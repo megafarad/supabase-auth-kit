@@ -21,7 +21,7 @@ const PRINCIPAL = "11111111-1111-4111-8111-111111111111";
 function contextWith(resolved: ResolvedPrincipal, scopes: string[] = []) {
     const query = vi.fn(async (sql: string): Promise<Row[]> => {
         if (sql.includes("effective_scopes")) {
-            return scopes.map(s => ({ result: s }));
+            return scopes.map(s => ({ scope_name: s }));
         }
 
         throw new Error(`unexpected sql: ${sql}`);

@@ -14,7 +14,10 @@
         "build"
       ],
       "env": [
-        "AUTHZ_TEST_DATABASE_URL"
+        "AUTHZ_TEST_DATABASE_URL",
+        "AUTHZ_TEST_SUPABASE_URL",
+        "AUTHZ_TEST_SUPABASE_SECRET_KEY",
+        "AUTHZ_TEST_SUPABASE_PUBLISHABLE_KEY"
       ],
       "outputs": []
     }

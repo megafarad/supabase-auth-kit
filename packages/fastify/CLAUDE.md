@@ -13,7 +13,7 @@ Fastify binding over `@sirhc77/supabase-auth-kit-core`. Thin by design, like the
 
 ```ts
 const auth = createFastifyAuthKit({
-    query,                                     // BYO: (sql, params) => Promise<Row[]>
+    supabase,                                  // secret-key client; or query: (sql, params) => Promise<Row[]>
     jwt: { jwksUrl: `${SUPABASE_URL}/auth/v1/.well-known/jwks.json` },
     resolveTenant: tenantFromParam("tenantId"),
 });
@@ -49,8 +49,8 @@ Guard errors need no setup. They carry `status` and `code`, which Fastify's defa
 
 ## The four rules from the model, as they land here
 
-- **The connection bypasses RLS.** It is the `postgres` owner connection string (`service_role` is `NOLOGIN` in Supabase); the `SECURITY DEFINER` functions are the enforcement path and the RLS policies are dormant defence in depth.
-- **Resolve the actor, then pass it explicitly.** `request.authKit.as` is the write API with the request's principal pre-bound, and `null` without one.
+- **The connection bypasses RLS.** It is the `postgres` owner connection string (`query`) or a supabase-js client holding the secret key (`supabase`) — see the transports in `packages/core/CLAUDE.md`; the `SECURITY DEFINER` functions are the enforcement path and the RLS policies are dormant defence in depth.
+- **Resolve the actor, then pass it explicitly.** `request.authKit.as` is the read and write API with the request's principal pre-bound, and `null` without one.
 - **No identity is zero scopes.** See the guard section; the SQL is already fail-closed and the adapter must not turn the null into a 500 or skip the check.
 - **Authorization is per (principal, tenant, scope)**, scope names are SQL identifiers used verbatim, and the traversal lives only in SQL.
 

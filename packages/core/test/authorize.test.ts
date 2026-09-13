@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { effectiveScopes, hasScope } from "../src/authorize.js";
 import type { QueryFn, Row } from "../src/query.js";
+import { fromQuery } from "../src/transport.js";
 
 /** Records every call so a test can assert the database was *not* consulted. */
 function stubQuery(rows: Row[] = []): QueryFn & { calls: unknown[][] } {
@@ -25,7 +26,7 @@ describe("hasScope fails closed", () => {
     it("denies a null principal without querying", async () => {
         const query = stubQuery([{ result: true }]);
 
-        expect(await hasScope(query, null, TENANT, "authz.roles.read")).toBe(
+        expect(await hasScope(fromQuery(query), null, TENANT, "authz.roles.read")).toBe(
             false,
         );
         expect(query.calls).toHaveLength(0);
@@ -34,7 +35,7 @@ describe("hasScope fails closed", () => {
     it("denies a null tenant without querying", async () => {
         const query = stubQuery([{ result: true }]);
 
-        expect(await hasScope(query, PRINCIPAL, null, "authz.roles.read")).toBe(
+        expect(await hasScope(fromQuery(query), PRINCIPAL, null, "authz.roles.read")).toBe(
             false,
         );
         expect(query.calls).toHaveLength(0);
@@ -45,7 +46,7 @@ describe("hasScope fails closed", () => {
     it("does consult the database when both are present", async () => {
         const query = stubQuery([{ result: true }]);
 
-        expect(await hasScope(query, PRINCIPAL, TENANT, "authz.roles.read")).toBe(
+        expect(await hasScope(fromQuery(query), PRINCIPAL, TENANT, "authz.roles.read")).toBe(
             true,
         );
         expect(query.calls).toHaveLength(1);
@@ -59,13 +60,13 @@ describe("hasScope fails closed", () => {
     it("denies when SQL says false", async () => {
         const query = stubQuery([{ result: false }]);
 
-        expect(await hasScope(query, PRINCIPAL, TENANT, "app.thing")).toBe(false);
+        expect(await hasScope(fromQuery(query), PRINCIPAL, TENANT, "app.thing")).toBe(false);
     });
 
     // A driver returning something other than a native boolean must not read as permission.
     it("denies on an unexpected result shape rather than coercing", async () => {
         for (const rows of [[], [{}], [{ result: "t" }], [{ result: 1 }]]) {
-            expect(await hasScope(stubQuery(rows), PRINCIPAL, TENANT, "x")).toBe(
+            expect(await hasScope(fromQuery(stubQuery(rows)), PRINCIPAL, TENANT, "x")).toBe(
                 false,
             );
         }
@@ -74,20 +75,20 @@ describe("hasScope fails closed", () => {
 
 describe("effectiveScopes", () => {
     it("is empty for a null principal or tenant, without querying", async () => {
-        const query = stubQuery([{ result: "app.thing" }]);
+        const query = stubQuery([{ scope_name: "app.thing" }]);
 
-        expect(await effectiveScopes(query, null, TENANT)).toEqual([]);
-        expect(await effectiveScopes(query, PRINCIPAL, null)).toEqual([]);
+        expect(await effectiveScopes(fromQuery(query), null, TENANT)).toEqual([]);
+        expect(await effectiveScopes(fromQuery(query), PRINCIPAL, null)).toEqual([]);
         expect(query.calls).toHaveLength(0);
     });
 
     it("returns scope names verbatim, with no case mapping", async () => {
         const query = stubQuery([
-            { result: "authz.roles.write" },
-            { result: "authz.bindings.grant" },
+            { scope_name: "authz.roles.write" },
+            { scope_name: "authz.bindings.grant" },
         ]);
 
-        expect(await effectiveScopes(query, PRINCIPAL, TENANT)).toEqual([
+        expect(await effectiveScopes(fromQuery(query), PRINCIPAL, TENANT)).toEqual([
             "authz.roles.write",
             "authz.bindings.grant",
         ]);

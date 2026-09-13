@@ -1,4 +1,4 @@
-import { column, scalar, type QueryFn } from "./query.js";
+import type { AuthzTransport } from "./transport.js";
 
 /**
  * Whether a principal holds a scope at a tenant.
@@ -13,7 +13,7 @@ import { column, scalar, type QueryFn } from "./query.js";
  * live in `authz.tenant_chain`. Never re-derive any of it here.
  */
 export async function hasScope(
-    query: QueryFn,
+    transport: AuthzTransport,
     principalId: string | null,
     tenantId: string | null,
     scope: string,
@@ -23,11 +23,11 @@ export async function hasScope(
     }
 
     return (
-        (await scalar<boolean>(
-            query,
-            "select authz.has_scope($1, $2, $3) as result",
-            [principalId, tenantId, scope],
-        )) === true
+        (await transport.scalar("has_scope", {
+            p_principal_id: principalId,
+            p_tenant_id: tenantId,
+            p_scope: scope,
+        })) === true
     );
 }
 
@@ -39,7 +39,7 @@ export async function hasScope(
  * there is no camelCase mapping layer anywhere in the kit.
  */
 export async function effectiveScopes(
-    query: QueryFn,
+    transport: AuthzTransport,
     principalId: string | null,
     tenantId: string | null,
 ): Promise<string[]> {
@@ -47,9 +47,10 @@ export async function effectiveScopes(
         return [];
     }
 
-    return column<string>(
-        query,
-        "select scope_name as result from authz.effective_scopes($1, $2)",
-        [principalId, tenantId],
-    );
+    const rows = await transport.rows("effective_scopes", {
+        p_principal_id: principalId,
+        p_tenant_id: tenantId,
+    });
+
+    return rows.map(row => row["scope_name"] as string);
 }
