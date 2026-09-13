@@ -31,7 +31,7 @@ function build(stub: Stub) {
         }
 
         if (sql.includes("effective_scopes")) {
-            return (stub.scopes ?? []).map(s => ({ result: s }));
+            return (stub.scopes ?? []).map(s => ({ scope_name: s }));
         }
 
         throw new Error(`unexpected sql: ${sql}`);

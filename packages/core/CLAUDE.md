@@ -6,18 +6,27 @@ The framework-agnostic half of the kit. `packages/express` and `packages/fastify
 
 - `jose` is the only runtime dependency in the repo. It is declared here deliberately: `jose` also appears in `node_modules` as a transitive of the `supabase` CLI devDependency, so relying on that would work locally and break for every consumer.
 - ESM only, `module: NodeNext`, `strict: true`, `declaration: true`, `src/` → `dist/`, `files` ships `dist`. `"types": ["node"]` is required — jose's remote JWKS uses global `fetch`.
-- Tests live in `test/`, outside the tsconfig's `include: ["src"]`, so they never reach `dist`.
+- Tests live in `test/`, outside the tsconfig's `include: ["src"]`, so they never reach `dist`. The integration suites share `test/integration/stack.ts` and run once per transport (`describe.each(TRANSPORTS)`); the supabase-js case needs the API on :54321 with `authz` exposed, and skips without it. `@supabase/supabase-js` is a root devDependency for those tests only — core must never import it.
 
-## The database seam
+## The database seam: transports
 
-`QueryFn` is `(sql, params) => Promise<Row[]>` — bring your own driver, so the package depends on none and can sit on a pool the app already has.
+Core never builds SQL above `transport.ts`. Everything calls an `AuthzTransport` **by function name, with arguments keyed by their SQL parameter names** (`p_actor_principal_id`, …):
 
-```ts
-pg:          (sql, params) => pool.query(sql, params).then(r => r.rows)
-postgres.js: (sql, params) => sql.unsafe(sql, params)
-```
+| Transport | Reaches the database as | Option |
+| --- | --- | --- |
+| `fromQuery(queryFn)` | the `postgres` owner, on a direct connection. Builds `select authz.fn(p_x => $1, …)` — Postgres named notation, so both transports share one argument contract | `query` |
+| `fromSupabase(client)` | `service_role`, through PostgREST: `client.schema('authz').rpc(fn, args)` with the secret key. Needs `authz` in the project's exposed schemas | `supabase` |
 
-**The connection is the `postgres` owner connection string, not the service key.** `service_role` is `NOLOGIN` in Supabase and only reaches tables through PostgREST, which does not expose `authz`. That connection bypasses RLS, so the `SECURITY DEFINER` functions are the only enforcement — every statement this package issues is a `select authz.<fn>(…)`, and it issues no DML.
+`createAuthKit` takes exactly one of `query`, `supabase` or `transport`, as optional fields on one interface rather than a union — the Express and Fastify option types `extends` it.
+
+Rules the two must keep, because nothing above them can tell which is in use:
+
+- **Only names from `AUTHZ_FUNCTIONS` are called**, and that list is the `service_role` grant list — `privileges.integration.test.ts` holds them equal. `fromQuery` interpolates names into SQL text, so it also checks every function and argument name against a strict identifier pattern; values only ever travel as bind parameters.
+- **Same value shapes.** JSON can only carry strings, so `fromQuery` turns `Date`s into ISO strings, and writes serialise `Date` arguments themselves. `undefined` arguments are omitted (the SQL default applies); `null` is passed.
+- **Same errors.** supabase-js *resolves* with `{ error }`; `fromSupabase` re-raises it as an `Error` carrying PostgREST's `code`, the shape `pg` throws. `createAuthKit` wraps whichever transport in `rethrowAsAuthKitError` once, so checks, reads and writes all surface typed errors.
+- **`SupabaseRpcClient` is typed loosely on purpose** (`schema(schema: never): unknown`). A client created with generated types narrows `schema()` to the schemas in those types, which do not include `authz`, so any precise signature rejects it and forces every typed app to cast. The precise shape lives privately in `fromSupabase`.
+
+Neither connection is subject to RLS (the owner bypasses it; `service_role` has `BYPASSRLS`), so the `SECURITY DEFINER` functions are the only enforcement, and core issues nothing but calls to them.
 
 Values must come back as native types. `hasScope` treats anything that is not `true` as false, so a driver that stringified booleans would fail closed but silently deny.
 
@@ -38,11 +47,16 @@ Local and asymmetric. Supabase issues **ES256 via JWKS** — confirmed against a
 - `createRemoteJWKSet` is built once at factory time, never per request — that object *is* the key cache.
 - `verifyBearer` can be supplied directly instead of `jwt`, for apps that already verify tokens (`supabase.auth.getUser`, a gateway) and should not do it twice.
 
-## Writes
+## Writes and reads
 
-`kit.as(principalId)` returns the thirteen mutating functions with the actor pre-bound. Binding it is the point: the SQL takes the actor as its first argument precisely so nothing reads the JWT, and a caller who threads it by hand will eventually thread the wrong one. Nothing here re-checks authority — a check in TypeScript would be a second opinion that can disagree with the enforcing one.
+`kit.as(principalId)` returns `ActorApi` — the thirteen mutating functions (`writes.ts`) and the read functions (`reads.ts`), all with the actor pre-bound. Binding it is the point: the SQL takes the actor as its first argument precisely so nothing reads the JWT, and a caller who threads it by hand will eventually thread the wrong one. Nothing here re-checks authority — a check in TypeScript would be a second opinion that can disagree with the enforcing one.
 
-Errors are typed by SQLSTATE. Every guard in SQL raises bare, so all of them arrive as `P0001` and map to `AuthzDeniedError` — which is the honest reading from a caller's side and has the useful property of not leaking whether a role or tenant exists. `P0002`/`P0003` (a `select … into strict` that found nothing) map to `AuthzStateError`, usually meaning the bootstrap migration has not run. Finer classification of the `P0001` group would need `using errcode = …` on those 34 raise sites; adding it later only changes the table in `errors.ts`.
+Reads return `Page<T>` (`{ rows, nextCursor }`) over the keyset paging in SQL. Rows are `snake_case`, as everywhere, with `page_cursor` stripped. Two things are done in TypeScript as well as SQL, deliberately:
+
+- **The limit clamp** ([1, 1000], default 100), so a full page is recognised as full and a fractional limit is not a cast error.
+- **Cursor validation.** SQL compares the sort key before the id half, so a garbage cursor usually filters silently instead of failing the uuid cast. Checking the 36-character id prefix up front turns it into an `AuthzUsageError`.
+
+Errors are typed by SQLSTATE. Every guard in SQL raises bare, so all of them arrive as `P0001` and map to `AuthzDeniedError` — which is the honest reading from a caller's side and has the useful property of not leaking whether a role or tenant exists. `P0002`/`P0003` (a `select … into strict` that found nothing) map to `AuthzStateError`, usually meaning the bootstrap migration has not run. `42501`, `PGRST106` and `PGRST202` are wiring — permission denied, schema not exposed, function unknown to PostgREST — and map to `AuthzConfigError` with the fix appended to the message; they are deliberately not `AuthzDeniedError`, because a misconfigured deployment answering 403 to everyone reads as a caller problem. Finer classification of the `P0001` group would need `using errcode = …` on those 34 raise sites; adding it later only changes the table in `errors.ts`.
 
 ## HTTP layer shared by the adapters
 

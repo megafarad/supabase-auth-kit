@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Authorization is hierarchical multi-tenancy in SQL: tenants form a tree with exactly one master (the single `parent_id IS NULL` row), principals (users **and** API keys) hold roles at tenants through `role_bindings`, and both role/scope *definitions* and *bindings* propagate down the tree — filtered, not truncated, at any tenant with `inherit = false`, which roles marked `crosses_boundary` pass through anyway. There is no membership table: membership **is** a live binding.
 
-**The model lives in SQL; TypeScript only calls it.** `packages/core` wraps the schema and holds the HTTP layer both adapters share (the guard order, the per-request scope memo, the errors); `packages/express` and `packages/fastify` bind it to their frameworks. Do not re-derive the traversal in TypeScript — `authz.has_scope(principal, tenant, scope)` is the predicate and `authz.tenant_chain(tenant)` is the one place the inherit/`crosses_boundary` rule is implemented.
+**The model lives in SQL; TypeScript only calls it.** `packages/core` wraps the schema — calling its functions by name over a direct Postgres connection or a secret-key supabase-js client — and holds the HTTP layer both adapters share (the guard order, the per-request scope memo, the errors); `packages/express` and `packages/fastify` bind it to their frameworks. Do not re-derive the traversal in TypeScript — `authz.has_scope(principal, tenant, scope)` is the predicate and `authz.tenant_chain(tenant)` is the one place the inherit/`crosses_boundary` rule is implemented.
 
 ## Where the detail lives
 
@@ -49,7 +49,7 @@ Single-package work: `npm run build -w @sirhc77/supabase-auth-kit-express` (or `
 ## Conventions
 
 - ESM throughout (`"type": "module"`), TypeScript `module: NodeNext`, `strict: true`. Adapter packages compile with `declaration: true` from `src/` to `dist/`; the installer compiles from `bin/` to `dist/`. Every tsconfig pins `include` and `exclude` — without them `tsc` picks up previously emitted output and nests a stale `dist/src/`.
-- `typescript`, `vitest` and `pg` are declared once, in the root `devDependencies`, and shared by every workspace. The root package is `private` so Changesets never tries to publish the workspace root. Tests live in each package's `test/`, outside the tsconfig `include`, so they never reach `dist`.
+- `typescript`, `vitest`, `pg` and `@supabase/supabase-js` are declared once, in the root `devDependencies`, and shared by every workspace. The last is for the integration tests only: no package may depend on it at runtime. The root package is `private` so Changesets never tries to publish the workspace root. Tests live in each package's `test/`, outside the tsconfig `include`, so they never reach `dist`.
 - Published packages declare `main`/`types`/`exports` pointing at `dist/`, and restrict `files` to what ships. The installer is bin-only and has no library entry point.
 - SQL identifiers are `snake_case` throughout. Refer to columns by their real names (`crosses_boundary`, not `crossesBoundary`) — no camelCase mapping layer exists yet.
 - Versioning and publishing go through Changesets (no `.changeset/` directory exists yet — `npx changeset init` before the first release).

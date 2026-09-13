@@ -1,13 +1,14 @@
 -- Row level security policies for @sirhc77/supabase-auth-kit.
 --
--- These are DEFENCE IN DEPTH, not the live enforcement path. The kit runs posture A: the
--- authz schema is absent from [api] schemas, nothing is GRANTed to authenticated or anon,
--- and adapters hold a service_role connection which carries BYPASSRLS. So no role that RLS
--- governs can currently reach these tables at all, and every policy here is dormant.
+-- These are DEFENCE IN DEPTH, not the live enforcement path. The kit runs posture A, server
+-- only: nothing is GRANTed to authenticated or anon, and the server reaches authz either as
+-- the owner on a direct connection or as service_role through PostgREST -- which has BYPASSRLS
+-- and is granted functions, never tables. So no role that RLS governs can currently reach these
+-- tables at all, and every policy here is dormant.
 --
--- They exist so the tables are already governed the day someone grants access or exposes the
--- schema, rather than being wide open at that moment. Do not add GRANTs alongside them
--- without deciding to move to posture B -- the absence of grants is what posture A is.
+-- They exist so the tables are already governed the day someone grants a table to an API
+-- role, rather than being wide open at that moment. Do not grant anything here to anon or
+-- authenticated without deciding to move to posture B.
 --
 -- SELECT ONLY, deliberately. Every guarded write already has a SECURITY DEFINER function in
 -- 001 carrying its rules, and those run as the owner and bypass RLS. Writing WITH CHECK

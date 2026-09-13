@@ -1,4 +1,5 @@
 import { effectiveScopes, hasScope } from "./authorize.js";
+import { rethrowAsAuthKitError } from "./errors.js";
 import {
     createBearerVerifier,
     principalForApiKey,
@@ -8,14 +9,44 @@ import {
     type VerifyBearer,
 } from "./identity.js";
 import type { QueryFn } from "./query.js";
+import { createReadApi, type ReadApi } from "./reads.js";
+import {
+    fromQuery,
+    fromSupabase,
+    type AuthzTransport,
+    type SupabaseRpcClient,
+} from "./transport.js";
 import { createWriteApi, type WriteApi } from "./writes.js";
 
 export type { QueryFn, Row } from "./query.js";
 export type { JwtOptions, VerifyBearer } from "./identity.js";
 export type { WriteApi } from "./writes.js";
+export type {
+    ApiKeyRow,
+    Page,
+    PageOptions,
+    PrincipalBindingRow,
+    ReadApi,
+    RoleRow,
+    RoleScopeRow,
+    ScopeRow,
+    TenantBindingRow,
+    TenantRow,
+} from "./reads.js";
+export {
+    AUTHZ_FUNCTIONS,
+    fromQuery,
+    fromSupabase,
+    type AuthzFunction,
+    type AuthzTransport,
+    type RpcArgs,
+    type SupabaseRpcClient,
+    type SupabaseRpcError,
+} from "./transport.js";
 export { isUuid } from "./uuid.js";
 export {
     AuthKitError,
+    AuthzConfigError,
     AuthzConflictError,
     AuthzDeniedError,
     AuthzStateError,
@@ -74,8 +105,24 @@ export interface Credentials {
     apiKey?: string | null | undefined;
 }
 
+/**
+ * Exactly one of `supabase`, `query` or `transport` says how to reach the database, and
+ * `createAuthKit` throws on zero or several. They are optional fields on one interface, rather
+ * than a union, so the framework bindings can keep extending it.
+ */
 export interface AuthKitOptions {
-    query: QueryFn;
+    /**
+     * A server-side supabase-js client holding the project's **secret key**. Needs the `authz`
+     * schema exposed to PostgREST. See `fromSupabase`.
+     */
+    supabase?: SupabaseRpcClient;
+    /**
+     * Runs parameterized SQL on a direct Postgres connection as the owner, e.g.
+     * `(sql, params) => pool.query(sql, [...params]).then(r => r.rows)`. See `fromQuery`.
+     */
+    query?: QueryFn;
+    /** Any other transport. Both of the above are shorthands for one of these. */
+    transport?: AuthzTransport;
     /**
      * JWKS-based verification against Supabase's endpoint. Required unless `verifyBearer` is
      * supplied instead.
@@ -107,14 +154,45 @@ export interface AuthKit {
         tenantId: string | null,
     ): Promise<string[]>;
     /**
-     * The write API with this actor pre-bound. Take it once per request, from the resolved
-     * principal, so the wrong actor cannot be threaded into a call by hand.
+     * The read and write APIs with this actor pre-bound. Take it once per request, from the
+     * resolved principal, so the wrong actor cannot be threaded into a call by hand.
      */
-    as(actorPrincipalId: string): WriteApi;
+    as(actorPrincipalId: string): ActorApi;
+}
+
+/** Everything that acts as a principal: the writes, and the reads that answer as that principal. */
+export type ActorApi = WriteApi & ReadApi;
+
+/**
+ * Every failure a transport raises passes through here once, so reads, writes and checks all
+ * surface the same typed errors whichever transport is underneath.
+ */
+function typed(transport: AuthzTransport): AuthzTransport {
+    return {
+        scalar: (fn, args) =>
+            transport.scalar(fn, args).catch(rethrowAsAuthKitError),
+        rows: (fn, args) => transport.rows(fn, args).catch(rethrowAsAuthKitError),
+    };
+}
+
+function transportFrom(options: AuthKitOptions): AuthzTransport {
+    const given = [
+        options.supabase === undefined ? undefined : fromSupabase(options.supabase),
+        options.query === undefined ? undefined : fromQuery(options.query),
+        options.transport,
+    ].filter((transport): transport is AuthzTransport => transport !== undefined);
+
+    if (given.length !== 1) {
+        throw new TypeError(
+            "createAuthKit requires exactly one of `supabase`, `query` or `transport`",
+        );
+    }
+
+    return typed(given[0] as AuthzTransport);
 }
 
 export function createAuthKit(options: AuthKitOptions): AuthKit {
-    const { query } = options;
+    const transport = transportFrom(options);
 
     const verifyBearer =
         options.verifyBearer ??
@@ -132,17 +210,18 @@ export function createAuthKit(options: AuthKitOptions): AuthKit {
         verifyBearer,
 
         principalForAuthUser: authUserId =>
-            principalForAuthUser(query, authUserId),
+            principalForAuthUser(transport, authUserId),
 
-        principalForApiKey: key => principalForApiKey(query, key),
+        principalForApiKey: key => principalForApiKey(transport, key),
 
-        principalIsActive: principalId => principalIsActive(query, principalId),
+        principalIsActive: principalId =>
+            principalIsActive(transport, principalId),
 
         async resolvePrincipal({ bearer, apiKey }) {
             // An API key wins when both are sent, so verify_api_key runs at most once and a
             // request never pays for two identity round trips.
             if (apiKey) {
-                const principalId = await principalForApiKey(query, apiKey);
+                const principalId = await principalForApiKey(transport, apiKey);
 
                 return {
                     principalId,
@@ -157,7 +236,7 @@ export function createAuthKit(options: AuthKitOptions): AuthKit {
                 const principalId =
                     authUserId === null
                         ? null
-                        : await principalForAuthUser(query, authUserId);
+                        : await principalForAuthUser(transport, authUserId);
 
                 return {
                     principalId,
@@ -174,11 +253,14 @@ export function createAuthKit(options: AuthKitOptions): AuthKit {
         },
 
         hasScope: (principalId, tenantId, scope) =>
-            hasScope(query, principalId, tenantId, scope),
+            hasScope(transport, principalId, tenantId, scope),
 
         effectiveScopes: (principalId, tenantId) =>
-            effectiveScopes(query, principalId, tenantId),
+            effectiveScopes(transport, principalId, tenantId),
 
-        as: actorPrincipalId => createWriteApi(query, actorPrincipalId),
+        as: actorPrincipalId => ({
+            ...createWriteApi(transport, actorPrincipalId),
+            ...createReadApi(transport, actorPrincipalId),
+        }),
     };
 }

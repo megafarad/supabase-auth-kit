@@ -1,5 +1,4 @@
-import { rethrowAsAuthKitError } from "./errors.js";
-import { scalar, type QueryFn } from "./query.js";
+import type { AuthzFunction, AuthzTransport, RpcArgs } from "./transport.js";
 
 /**
  * The thirteen mutating functions, with the actor pre-bound.
@@ -82,122 +81,104 @@ export interface WriteApi {
 }
 
 export function createWriteApi(
-    query: QueryFn,
+    transport: AuthzTransport,
     actorPrincipalId: string,
 ): WriteApi {
-    async function returning(
-        sql: string,
-        params: readonly unknown[],
-    ): Promise<string> {
-        try {
-            const value = await scalar<string>(query, sql, params);
-
-            if (value === null) {
-                throw new Error(`authz call returned no value: ${sql}`);
-            }
-
-            return value;
-        } catch (error) {
-            rethrowAsAuthKitError(error);
-        }
-    }
-
-    async function voidCall(
-        sql: string,
-        params: readonly unknown[],
-    ): Promise<void> {
-        try {
-            await query(sql, params);
-        } catch (error) {
-            rethrowAsAuthKitError(error);
-        }
-    }
-
     const actor = actorPrincipalId;
+
+    async function returning(fn: AuthzFunction, args: RpcArgs): Promise<string> {
+        const value = await transport.scalar(fn, {
+            p_actor_principal_id: actor,
+            ...args,
+        });
+
+        if (value === null) {
+            throw new Error(`authz.${fn} returned no value`);
+        }
+
+        return value as string;
+    }
+
+    async function voidCall(fn: AuthzFunction, args: RpcArgs): Promise<void> {
+        await transport.scalar(fn, { p_actor_principal_id: actor, ...args });
+    }
+
+    // Serialised here rather than left to each transport: pg would bind a Date natively, but
+    // JSON would stringify it anyway, and one explicit form keeps the two identical.
+    const timestamp = (value: Date | string | null): string | null =>
+        value instanceof Date ? value.toISOString() : value;
 
     return {
         grantRole: (principalId, roleId, tenantId, expiresAt = null) =>
-            returning(
-                "select authz.grant_role($1, $2, $3, $4, $5) as result",
-                [actor, principalId, roleId, tenantId, expiresAt],
-            ),
+            returning("grant_role", {
+                p_principal_id: principalId,
+                p_role_id: roleId,
+                p_tenant_id: tenantId,
+                p_expires_at: timestamp(expiresAt),
+            }),
 
         inviteUser: (tenantId, email, roleId) =>
-            returning("select authz.invite_user($1, $2, $3, $4) as result", [
-                actor,
-                tenantId,
-                email,
-                roleId,
-            ]),
+            returning("invite_user", {
+                p_tenant_id: tenantId,
+                p_email: email,
+                p_role_id: roleId,
+            }),
 
         revokeBinding: bindingId =>
-            voidCall("select authz.revoke_binding($1, $2)", [actor, bindingId]),
+            voidCall("revoke_binding", { p_binding_id: bindingId }),
 
         createRole: (tenantId, name, description, crossesBoundary = false) =>
-            returning(
-                "select authz.create_role($1, $2, $3, $4, $5) as result",
-                [actor, tenantId, name, description, crossesBoundary],
-            ),
+            returning("create_role", {
+                p_tenant_id: tenantId,
+                p_name: name,
+                p_description: description,
+                p_crosses_boundary: crossesBoundary,
+            }),
 
         updateRole: (roleId, changes) =>
-            voidCall("select authz.update_role($1, $2, $3, $4, $5)", [
-                actor,
-                roleId,
-                changes.name ?? null,
-                changes.description ?? null,
-                changes.crossesBoundary ?? null,
-            ]),
+            voidCall("update_role", {
+                p_role_id: roleId,
+                p_name: changes.name ?? null,
+                p_description: changes.description ?? null,
+                p_crosses_boundary: changes.crossesBoundary ?? null,
+            }),
 
         addRoleScope: (roleId, scopeId) =>
-            voidCall("select authz.add_role_scope($1, $2, $3)", [
-                actor,
-                roleId,
-                scopeId,
-            ]),
+            voidCall("add_role_scope", { p_role_id: roleId, p_scope_id: scopeId }),
 
         removeRoleScope: (roleId, scopeId) =>
-            voidCall("select authz.remove_role_scope($1, $2, $3)", [
-                actor,
-                roleId,
-                scopeId,
-            ]),
+            voidCall("remove_role_scope", {
+                p_role_id: roleId,
+                p_scope_id: scopeId,
+            }),
 
         createScope: (tenantId, name, description = null) =>
-            returning("select authz.create_scope($1, $2, $3, $4) as result", [
-                actor,
-                tenantId,
-                name,
-                description,
-            ]),
+            returning("create_scope", {
+                p_tenant_id: tenantId,
+                p_name: name,
+                p_description: description,
+            }),
 
         createTenant: (parentId, name) =>
-            returning("select authz.create_tenant($1, $2, $3) as result", [
-                actor,
-                parentId,
-                name,
-            ]),
+            returning("create_tenant", { p_parent_id: parentId, p_name: name }),
 
-        createWorkspace: name =>
-            returning("select authz.create_workspace($1, $2) as result", [
-                actor,
-                name,
-            ]),
+        createWorkspace: name => returning("create_workspace", { p_name: name }),
 
         updateTenant: (tenantId, changes) =>
-            voidCall("select authz.update_tenant($1, $2, $3, $4)", [
-                actor,
-                tenantId,
-                changes.name ?? null,
-                changes.inherit ?? null,
-            ]),
+            voidCall("update_tenant", {
+                p_tenant_id: tenantId,
+                p_name: changes.name ?? null,
+                p_inherit: changes.inherit ?? null,
+            }),
 
         createApiKey: (tenantId, label, expiresAt = null) =>
-            returning(
-                "select authz.create_api_key($1, $2, $3, $4) as result",
-                [actor, tenantId, label, expiresAt],
-            ),
+            returning("create_api_key", {
+                p_tenant_id: tenantId,
+                p_label: label,
+                p_expires_at: timestamp(expiresAt),
+            }),
 
         revokeApiKey: apiKeyId =>
-            voidCall("select authz.revoke_api_key($1, $2)", [actor, apiKeyId]),
+            voidCall("revoke_api_key", { p_api_key_id: apiKeyId }),
     };
 }

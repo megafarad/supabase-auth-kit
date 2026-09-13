@@ -32,6 +32,7 @@
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.2",
+    "@supabase/supabase-js": "^2.116.0",
     "@types/pg": "^8.15.5",
     "pg": "^8.16.3",
     "supabase": "^2.116.0",

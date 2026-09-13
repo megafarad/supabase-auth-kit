@@ -2,7 +2,7 @@
 
 Guidance for `apps/installer/supabase/` — the declarative schemas, the generated migrations, and the semantics they encode. See `../CLAUDE.md` for the migration pipeline that turns `schemas/` into `migrations/`, and the repo root `CLAUDE.md` for workspace-wide conventions.
 
-**The model below is implemented in SQL and consumed by `packages/core`.** `000_auth_kit_tables.sql` has the tables, `001_auth_kit_functions.sql` has identity provisioning, claiming, the resolver and the write functions, and `002_auth_kit_policies.sql` has the SELECT-only RLS policies — under posture A those policies are dormant, and the enforcement path is the functions, reached from `packages/core` through the Express and Fastify adapters. Changes to the model belong in those functions, not in a new traversal.
+**The model below is implemented in SQL and consumed by `packages/core`.** `000_auth_kit_tables.sql` has the tables, `001_auth_kit_functions.sql` has identity provisioning, claiming, the resolver, the write functions and the read functions, and `002_auth_kit_policies.sql` has the SELECT-only RLS policies — under posture A those policies are dormant, and the enforcement path is the functions, reached from `packages/core` (over a direct connection or supabase-js) through the Express and Fastify adapters. Changes to the model belong in those functions, not in a new traversal.
 
 ## Hierarchical multi-tenancy
 
@@ -102,9 +102,22 @@ All tables live in a dedicated `authz` schema, separate from Supabase's `auth` a
 - **`audit_logs` captures `before`/`after` jsonb** alongside request context (`request_id`, `method`, `route`, `ip`, `user_agent`).
 - **RLS is enabled on every table, with SELECT-only policies in `002_auth_kit_policies.sql`.** Any new table needs a matching `enable row level security` line and a policy, or it is deny-all.
 
-## Access posture (decided: A)
+## Access posture (decided: A, server-only)
 
-**The `authz` schema is private.** It is absent from `[api] schemas`, nothing is `GRANT`ed to `authenticated` or `anon`, and adapters hold a **direct Postgres connection as `postgres`**, the owner of the tables and functions, so RLS does not apply to it. Not `service_role`: in Supabase that role is `NOLOGIN` and exists only as a role PostgREST switches into, and PostgREST does not expose `authz`, so there is no way for an adapter to reach the schema as `service_role`. The write functions in `001` are therefore the enforcement path, and **the RLS policies in `002` are dormant defence in depth** — no role that RLS governs can reach these tables today. The absence of grants *is* the posture; do not add them without deciding to move to posture B.
+**Only the server reaches `authz`, and never as `anon` or `authenticated`.** Nothing is `GRANT`ed to either of them, and they have no `USAGE` on the schema. The server reaches it one of two ways, and core treats both the same:
+
+- **A direct Postgres connection as `postgres`**, the owner of the tables and functions (`fromQuery`). `service_role` cannot be used here: in Supabase it is `NOLOGIN`, a role PostgREST switches into and nothing else.
+- **supabase-js holding the secret key, through PostgREST** (`fromSupabase`). That is `service_role`, and it works because `20260913040000_auth_kit_rpc_privileges.sql` grants it `USAGE` on the schema and `EXECUTE` on **exactly** the functions core calls (`AUTHZ_FUNCTIONS` in `packages/core/src/transport.ts`, held equal by an integration test). The project must also add `authz` to its exposed schemas. That is project configuration, not something a migration can do; `config.toml` does it for the local stack.
+
+Neither role is subject to RLS — the owner bypasses it, `service_role` has `BYPASSRLS` and no table grants anyway — so **the functions in `001` are the enforcement path, and the RLS policies in `002` are dormant defence in depth**. The functions taking an explicit actor are safe to expose to `service_role` only because whoever holds a secret key is already trusted to name any actor.
+
+Exposing the schema changes what the grants are worth. While `authz` was unexposed, a stray grant was unreachable; now `service_role`'s `EXECUTE` set is reachable over HTTP by anyone holding the secret key, and an `anon` grant would be reachable by anyone at all. Hence three rules:
+
+- **Grant `service_role` function by function, never by default.** The rpc privileges migration revoked the default privilege `20260909060000` had set, so a new function is callable by nobody until a migration grants it. `provision_admin`, `reclaim_identity`, `claim_auth_user`, `bindings_in_force` and every internal helper stay ungranted.
+- **Never grant anything in `authz` to `anon` or `authenticated`.** Supabase's own guide to exposing a custom schema does exactly that, for all routines; a consumer following it would hand the public key `provision_admin`. The installer and the READMEs warn about it, and `privileges.integration.test.ts` fails if either role can reach anything.
+- **Never overload a function name.** PostgREST passes arguments by name and cannot tell overloads apart; a test asserts there are none.
+
+Verified over HTTP: the publishable key and no key both get `42501 permission denied for schema authz`; the secret key gets `42501` on `provision_admin`; PostgREST's OpenAPI listing for `service_role` shows exactly the granted functions.
 
 The policies are **SELECT-only**, deliberately. Every guarded write already has a `SECURITY DEFINER` function carrying its rules, so `WITH CHECK` clauses would duplicate each escalation rule somewhere it can drift — and RLS cannot express some of them anyway, since `WITH CHECK` never sees the old row. With no INSERT/UPDATE/DELETE policy, RLS denies all three by default: verified that `GRANT ALL` plus a platform-operator JWT still gets `new row violates row-level security policy` on insert, and `UPDATE 0` / `DELETE 0` on the others.
 
@@ -114,9 +127,9 @@ Verified by temporarily granting inside a rolled-back transaction: a tenant admi
 
 **`PUBLIC EXECUTE` has been revoked** from every `authz` function by `20260909060000_auth_kit_privileges.sql`, so a future `GRANT USAGE` on the schema no longer exposes anything by itself. That mattered most for the two functions carrying no authorization check at all by design — `provision_admin(email)` hands out master admin, `reclaim_identity(email)` relinks a retired identity to whoever now holds the address. Both are SQL-editor bootstrap tools.
 
-`postgres` owns the functions and holds `EXECUTE` implicitly, so the revoke does not touch the adapters' connection. `service_role` is also granted `EXECUTE` explicitly, because `PUBLIC` was its only grant and revoking that alone left it unable to call anything. No adapter depends on that grant, since none can log in as `service_role`. It only matters to code that already runs as `service_role` inside the database, and it would matter if posture B ever exposed `authz` through PostgREST. `supabase_auth_admin` is granted `EXECUTE` on `claim_auth_user()` specifically so revoking `PUBLIC` cannot break signup; verified end to end against the live Auth API, not just by direct insert.
+`postgres` owns the functions and holds `EXECUTE` implicitly, so no revoke touches the owner connection. `20260909060000` first granted `service_role` `EXECUTE` on everything, with a default privilege carrying that onto new functions; `20260913040000` replaced both with the explicit list above. `supabase_auth_admin` is granted `EXECUTE` on `claim_auth_user()` specifically so revoking `PUBLIC` cannot break signup; verified end to end against the live Auth API, not just by direct insert.
 
-**Remaining prerequisites for posture B.** JWT-bound wrapper overloads for the 13 explicit-actor write functions, so no caller can pass an arbitrary actor — the explicit-actor forms must never be granted. `verify_api_key` must never be granted at all: it takes a key, writes `last_used_at`, and would make the API a key-testing oracle. The policies in `002` name six functions directly (`has_scope`, `can_read_user`, `can_read_principal`, `role_tenant_id`, `current_principal_id`, `master_tenant_id`) and `authenticated` would need `EXECUTE` on those; three take a principal parameter, so granting them lets any user probe another principal's authority. Fixing that means JWT-bound predicate variants, which costs the InitPlan hoist that currently evaluates the principal once per query instead of once per row. Prefer a separate exposed `authz_api` schema of `security_invoker` views and distinctly-named wrappers over exposing `authz` itself — that keeps `key_hash` out structurally and avoids PostgREST overload ambiguity.
+**Remaining prerequisites for posture B** — exposing `authz` to `authenticated`, which is a different posture from the server-only exposure above. JWT-bound wrapper overloads for the 13 explicit-actor write functions, so no caller can pass an arbitrary actor — the explicit-actor forms must never be granted. `verify_api_key` must never be granted at all: it takes a key, writes `last_used_at`, and would make the API a key-testing oracle. The policies in `002` name six functions directly (`has_scope`, `can_read_user`, `can_read_principal`, `role_tenant_id`, `current_principal_id`, `master_tenant_id`) and `authenticated` would need `EXECUTE` on those; three take a principal parameter, so granting them lets any user probe another principal's authority. Fixing that means JWT-bound predicate variants, which costs the InitPlan hoist that currently evaluates the principal once per query instead of once per row. Prefer a separate exposed `authz_api` schema of `security_invoker` views and distinctly-named wrappers over exposing `authz` itself — that keeps `key_hash` out structurally and avoids PostgREST overload ambiguity.
 
 Also note `current_principal_id()` propagates a cast error rather than returning null if `request.jwt.claims` carries a non-UUID `sub`; that denies the query rather than opening it, but it is noisy.
 
@@ -129,7 +142,8 @@ The whole inherit/`crosses_boundary` rule lives in one place, `authz.tenant_chai
 | `tenant_chain(tenant)` | ancestor walk + the `crossed` flag; depth-capped at 64 against cycles |
 | `effective_roles(tenant)` | role defs, `distinct on (name) order by depth` — the left-biased merge |
 | `effective_scope_defs(tenant)` | scope defs; past a cut only those hanging off a crossing role |
-| `effective_bindings(principal, tenant)` | live grants, filtering revoked/expired/disabled |
+| `bindings_in_force(tenant)` | every live grant in force at a tenant, for any principal — the one place grants are read. **Invoker, not definer, with no `SET`**, so it inlines; see below |
+| `effective_bindings(principal, tenant)` | `bindings_in_force` narrowed to one principal |
 | `effective_scopes(principal, tenant)` | scope names held, via each binding's own `role_id` |
 | `has_scope(principal, tenant, scope)` | the RLS predicate |
 | `current_principal_id()` | JWT → principal; delegates to the next row |
@@ -151,6 +165,13 @@ The whole inherit/`crosses_boundary` rule lives in one place, `authz.tenant_chai
 | `create_api_key(actor, tenant, label, expires)` | returns the plaintext **once** |
 | `verify_api_key(key)` | key → principal, or null; the API-key half of `current_principal_id()` |
 | `revoke_api_key(actor, key)` | revoke by timestamp; idempotent |
+| `get_tenant(actor, tenant)` | one tenant, with `tenants.read` there |
+| `list_child_tenants(actor, parent, limit, after)` | children with `tenants.read`; inheriting children answered by one check at the parent |
+| `list_principal_bindings(actor, principal, limit, after)` | a principal's live bindings: all of them to themselves, else where the actor has `bindings.read` |
+| `list_tenant_bindings(actor, tenant, include_inherited, limit, after)` | a tenant's members, pending invites included |
+| `list_roles` / `list_scopes(actor, tenant, limit, after)` | definitions in effect at a tenant, after shadowing |
+| `list_role_scopes(actor, tenant, role, limit, after)` | what a role in effect at a tenant confers |
+| `list_api_keys(actor, tenant, limit, after)` | keys issued at a tenant; **never `key_hash`** |
 
 **Mutating functions take the actor explicitly rather than reading the JWT.** An adapter holds a direct `postgres` connection with no `request.jwt.claims` set, so `auth.uid()` is null there, and API-key principals never carry a JWT at all — both resolve the caller themselves and pass it in. `current_principal_id()` is for a JWT-bound wrapper overload, which is the only form that should ever be granted to `authenticated`; the explicit-actor form must not be, or any caller could impersonate any principal.
 
@@ -186,9 +207,27 @@ The parent anchor also makes a cut **self-healing**. An administrator who cuts o
 
 `principal_is_active` asks a **different** question from the filter inside `effective_bindings`, which is why they are not shared. That one asks what a principal *would* hold and admits unclaimed identities on purpose, so an admin view can see grants waiting for someone who has not signed up. This one asks whether somebody is actually behind the principal, so an unclaimed identity fails — nobody can have authenticated as one.
 
-These guards live in the functions, not in constraints, so they bind callers going through the sanctioned API — which under posture A is every caller, since the adapter holds the only connection. Note also that no table has an `updated_at` trigger; functions that amend rows set it explicitly, and a direct `UPDATE` that forgets to will leave it stale.
+These guards live in the functions, not in constraints, so they bind callers going through the sanctioned API — which under posture A is every caller, since only the server can reach the schema at all. Note also that no table has an `updated_at` trigger; functions that amend rows set it explicitly, and a direct `UPDATE` that forgets to will leave it stale.
 
-All are `stable` and `security definer` — the authz tables have RLS on with no policies, so the owner bypass makes these the only sanctioned read path, and the `authz` schema is absent from `[api] schemas` so none of it is reachable through PostgREST.
+The read helpers are `stable` and `security definer` — the owner bypasses RLS, so these are the only sanctioned read path — with one deliberate exception, below.
+
+**`bindings_in_force` is an invoker function on purpose.** `security definer` and a `SET` clause each stop Postgres inlining a SQL function, and inlining is what lets the planner push `effective_bindings`' principal filter into the query. Measured with 20k bindings at one tenant: as an opaque definer call, `has_scope` got 35× slower, because every check materialised the whole tenant's bindings first; inlined, it costs what it did when the query lived inside `effective_bindings`. It is safe only while nothing but the owner can execute it — it then runs inside the definer functions that call it, as the owner, under their empty `search_path`. Never grant it.
+
+## Reads
+
+**Reads are functions, shaped like the writes**: explicit actor, `security definer`, the rule inside. They answer the policies' visibility questions, and `reads.integration.test.ts` claims real identities in a rolled-back transaction and asserts the two agree on every row set they share: child tenants, a tenant's API keys, a tenant's own bindings, and a principal's bindings.
+
+- **Refusal is filtering, never an exception** — zero rows, as RLS returns, so a read cannot probe what exists.
+- **Resolved where a policy is per-row.** `list_roles`, `list_scopes` and `list_role_scopes` answer "what is in effect at this tenant" and gate on the read scope *at that tenant*. The `roles` policy gates each row on its owning tenant instead, which would hide every inherited role — `tenant_admin` included — from a tenant admin. This is a deliberate divergence from the policies, not an oversight, and it is why those three are excluded from the parity test.
+- **Your own bindings are always visible**, as in the `role_bindings` policy, and **membership reveals names**: your own binding shows its tenant's and role's names without `tenants.read`/`roles.read`, because a tenant switcher that cannot name your tenants is useless.
+- **Member details are gated where the binding was made.** `list_tenant_bindings` shows email with `users.read` at the binding's own tenant. That is narrower than `can_read_user`, which also admits someone readable through another tenant, and it is deliberate: `can_read_user` is a query per row, and ordering by email would force it onto every member of the tenant, not just one page.
+- **Inherited bindings are opt-in** (`include_inherited`), because under the master they include the platform operators. Each is still shown only with `bindings.read` where it was made, so a tenant admin sees none from above.
+- **Lists page by keyset.** PostgREST truncates RPC results at `max_rows` (1000) silently, so nothing returns an unbounded set. `page_cursor` is the row's id followed by its sort key — ids are fixed-width, so no delimiter is needed. `p_limit` is clamped to [1, 1000].
+
+Two performance rules the reads depend on, both measured on 20k members:
+
+- `list_tenant_bindings` computes authority once per tenant in the chain, in a CTE marked **`MATERIALIZED`**. Without it Postgres inlines the CTE and runs the `has_scope` calls per member row: 43 seconds per page, against ~125 ms.
+- `list_child_tenants` answers every *inheriting* child with one check at the parent. That is sound because an inheriting child receives every binding in force at its parent, so authority there implies authority at the child; only `inherit = false` children need their own check. It keeps listing the master's workspaces cheap for an operator. For a caller *without* authority at the parent it still checks every child, so it is not a way to find your own tenants — `list_principal_bindings` is.
 
 ## Open questions
 

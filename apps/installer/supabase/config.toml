@@ -10,7 +10,10 @@ enabled = true
 port = 54321
 # Schemas to expose in your API. Tables, views and stored procedures in this schema will get API
 # endpoints. `public` and `graphql_public` schemas are included by default.
-schemas = ["public", "graphql_public"]
+# `authz` is exposed so a server-side supabase-js client holding the secret key can call its
+# functions. Only service_role has USAGE on it (20260913040000_auth_kit_rpc_privileges.sql);
+# never grant anon or authenticated anything there.
+schemas = ["public", "graphql_public", "authz"]
 # Extra schemas to add to the search_path of every request.
 extra_search_path = ["public", "extensions"]
 # The maximum number of rows returns from a view, table, or stored procedure. Limits payload size
