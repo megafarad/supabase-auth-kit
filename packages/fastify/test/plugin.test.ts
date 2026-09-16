@@ -21,7 +21,9 @@ interface Stub {
 }
 
 function build(stub: Stub) {
-    const query = vi.fn(async (sql: string) => {
+    const audited: unknown[][] = [];
+
+    const query = vi.fn(async (sql: string, params: readonly unknown[]) => {
         if (sql.includes("principal_for_auth_user")) {
             return [{ result: stub.principal ?? null }];
         }
@@ -32,6 +34,12 @@ function build(stub: Stub) {
 
         if (sql.includes("effective_scopes")) {
             return (stub.scopes ?? []).map(s => ({ scope_name: s }));
+        }
+
+        if (sql.includes("log_audit")) {
+            audited.push([...params]);
+
+            return [{ result: "audit-row" }];
         }
 
         throw new Error(`unexpected sql: ${sql}`);
@@ -45,7 +53,7 @@ function build(stub: Stub) {
 
     const handler = vi.fn(async () => ({ ok: true }));
 
-    return { auth, query, handler };
+    return { auth, query, handler, audited };
 }
 
 const effectiveScopeCalls = (query: ReturnType<typeof build>["query"]) =>
@@ -433,5 +441,82 @@ describe("plugin", () => {
         expect(res.statusCode).toBe(400);
         expect(res.json().code).toBe("tenant_required");
         expect(handler).not.toHaveBeenCalled();
+    });
+});
+
+describe("audit context on Fastify", () => {
+    let app: FastifyInstance;
+
+    beforeEach(() => {
+        app = fastify();
+    });
+
+    afterEach(async () => {
+        await app.close();
+    });
+
+    it("records a refused request against the matched route pattern", async () => {
+        const { auth, handler, audited } = build({ principal: PRINCIPAL, scopes: [] });
+
+        await app.register(auth.plugin);
+        app.post(
+            "/t/:tenantId/x",
+            { onRequest: auth.requireScope("authz.roles.read") },
+            handler,
+        );
+
+        const res = await app.inject({
+            method: "POST",
+            url: `/t/${TENANT}/x`,
+            headers: { authorization: "Bearer tok", "user-agent": "vitest" },
+        });
+
+        expect(res.statusCode).toBe(403);
+        expect(handler).not.toHaveBeenCalled();
+        expect(audited).toHaveLength(1);
+
+        const context = audited[0]?.at(-1) as Record<string, string>;
+
+        expect(context).toMatchObject({
+            method: "POST",
+            user_agent: "vitest",
+            // The pattern, not the path: audit rows group by route rather than by every
+            // distinct tenant id, which is what Express cannot give.
+            route: "/t/:tenantId/x",
+        });
+
+        // Fastify's own request id, so the row correlates with its logs without a header.
+        expect(context["request_id"]).toBeTruthy();
+    });
+
+    it("records a credential that maps to no identity, with no tenant", async () => {
+        const { auth, handler, audited } = build({ principal: null });
+
+        await app.register(auth.plugin);
+        app.get("/t/:tenantId/x", { onRequest: auth.requireScope("x") }, handler);
+
+        const res = await app.inject({
+            method: "GET",
+            url: `/t/${TENANT}/x`,
+            headers: { authorization: "Bearer tok" },
+        });
+
+        expect(res.statusCode).toBe(403);
+        expect(audited).toHaveLength(1);
+        // No principal to bind and no tenant resolved yet: a platform-level row.
+        expect(audited[0]).toContain("authenticate");
+        expect(audited[0]).not.toContain(TENANT);
+    });
+
+    it("records nothing when the request presented no credential", async () => {
+        const { auth, handler, audited } = build({ principal: PRINCIPAL, scopes: [] });
+
+        await app.register(auth.plugin);
+        app.get("/t/:tenantId/x", { onRequest: auth.requireScope("x") }, handler);
+
+        const res = await app.inject({ method: "GET", url: `/t/${TENANT}/x` });
+
+        expect(res.statusCode).toBe(401);
+        expect(audited).toHaveLength(0);
     });
 });

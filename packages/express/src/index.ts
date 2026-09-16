@@ -12,8 +12,11 @@ import {
     type AuthKitOptions,
     type AuthzContext,
     type GuardCheck,
+    type RequestContext,
     type TenantResolver as CoreTenantResolver,
 } from "@sirhc77/supabase-auth-kit-core";
+import { randomUUID } from "node:crypto";
+
 import type { ErrorRequestHandler, Request, RequestHandler } from "express";
 
 import { wrapAsync } from "./async.js";
@@ -32,7 +35,14 @@ export {
     tenantFromParam,
     tenantFromQuery,
 } from "@sirhc77/supabase-auth-kit-core";
-export type { AuthKit, AuthzContext } from "@sirhc77/supabase-auth-kit-core";
+export type {
+    AuditEntry,
+    AuditFilter,
+    AuditLogRow,
+    AuthKit,
+    AuthzContext,
+    RequestContext,
+} from "@sirhc77/supabase-auth-kit-core";
 
 /**
  * Where a request says which tenant it concerns. The core's helpers (`tenantFromParam` and
@@ -64,6 +74,40 @@ export interface ExpressAuthKitOptions extends AuthKitOptions {
     resolveTenant: TenantResolver;
     /** Header carrying a plaintext API key. Defaults to `x-api-key`. */
     apiKeyHeader?: string;
+    /**
+     * What the audit rows written during a request should say about it. Defaults to
+     * `requestContextFromExpress`; return null to record nothing about the request itself.
+     */
+    requestContext?: (request: Request) => RequestContext | null;
+}
+
+/**
+ * The default request context on Express, which is poorer than Fastify's in two ways worth
+ * knowing about.
+ *
+ * **The route is the URL, not the pattern.** `req.route` is not populated until Express has
+ * matched a route, and `authenticate()` runs before that, so `/tenants/9f3.../members` is what
+ * lands in the column rather than `/tenants/:id/members`. Grouping audit rows by route therefore
+ * needs the pattern supplied here by a consumer who has it.
+ *
+ * **The request id is generated unless a header carries one.** Express has no equivalent of
+ * Fastify's `request.id`, so `x-request-id` is honoured if present and a uuid minted otherwise.
+ * A minted id still correlates the rows of one request with each other, which is most of the
+ * value; correlating them with the app's own logs needs the app to use the same id.
+ *
+ * `req.ip` honours the app's `trust proxy` setting, so a deployment behind a load balancer that
+ * has not set it will record the balancer's address.
+ */
+export function requestContextFromExpress(request: Request): RequestContext {
+    const header = request.headers["x-request-id"];
+
+    return {
+        requestId: (Array.isArray(header) ? header[0] : header) ?? randomUUID(),
+        method: request.method,
+        route: request.originalUrl || request.url,
+        ip: request.ip,
+        userAgent: request.headers["user-agent"],
+    };
 }
 
 export interface GuardOptions {
@@ -112,7 +156,12 @@ export interface ExpressAuthKit {
 export function createExpressAuthKit(
     options: ExpressAuthKitOptions,
 ): ExpressAuthKit {
-    const { resolveTenant, apiKeyHeader = "x-api-key", ...kitOptions } = options;
+    const {
+        resolveTenant,
+        apiKeyHeader = "x-api-key",
+        requestContext = requestContextFromExpress,
+        ...kitOptions
+    } = options;
     const kit = createAuthKit(kitOptions);
 
     /** The decision order lives in the core's `enforceGuard`; this only binds it to Express. */
@@ -135,7 +184,11 @@ export function createExpressAuthKit(
                     credentialsFromHeaders(req.headers, apiKeyHeader),
                 );
 
-                req.authKit = createAuthzContext(kit, resolved);
+                req.authKit = createAuthzContext(
+                    kit,
+                    resolved,
+                    requestContext(req),
+                );
 
                 next();
             }),

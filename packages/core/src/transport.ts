@@ -30,6 +30,9 @@ export const AUTHZ_FUNCTIONS = [
     "update_tenant",
     "create_api_key",
     "revoke_api_key",
+    // audit
+    "log_audit",
+    "prune_audit_logs",
     // reads
     "get_tenant",
     "list_child_tenants",
@@ -39,6 +42,7 @@ export const AUTHZ_FUNCTIONS = [
     "list_role_scopes",
     "list_scopes",
     "list_api_keys",
+    "list_audit_logs",
 ] as const;
 
 export type AuthzFunction = (typeof AUTHZ_FUNCTIONS)[number];

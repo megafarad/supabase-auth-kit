@@ -70,6 +70,19 @@ Errors go to `next(err)`; `errorHandler()` is opt-in and re-delegates anything t
 
 Every helper validates UUID shape and returns `undefined` when absent or malformed. That is not hygiene: an arbitrary string reaching `has_scope` makes Postgres raise `22P02`, which would surface as a 500 for what is really a bad request. Letting the client name the tenant is safe — `has_scope` is the check, and a tenant you hold nothing at answers identically to one that does not exist, so there is no enumeration oracle. The consumer's obligation is **ordering**: guard first, then handler, and never scope a query on a resolved tenant before the guard has run.
 
+## Request context for audit rows
+
+`authenticate()` builds a `RequestContext` and passes it to `createAuthzContext`, which binds it alongside the actor so every audit row a request writes carries it. `requestContextFromExpress` is the default and is exported; the `requestContext` option replaces it, and returning `null` records rows with no request metadata.
+
+Express gives less than Fastify here, in two ways the default cannot fix and that are stated in its doc comment rather than hidden:
+
+- **The route is the URL, not the pattern.** `req.route` is not populated until Express has matched a route, and `authenticate()` runs as application-level middleware *before* that, so `req.originalUrl` is the honest answer. A consumer who wants `/t/:tenantId/x` has to supply it.
+- **The request id is minted unless a header carries one.** There is no `req.id`; `x-request-id` is honoured, and a uuid is generated otherwise. A minted id still correlates one request's rows with each other.
+
+`req.ip` honours `trust proxy`, so a deployment behind a load balancer that has not set it records the balancer's address.
+
+The denial rows themselves come from the core's `enforceGuard` — see `packages/core/CLAUDE.md` — so both adapters record the same two 403 branches and neither records the 401.
+
 ## Known consideration
 
 When a request carries both an API key and a bearer token, the API key wins (core's `resolvePrincipal`). An alternative is to reject the request outright, on the grounds that silent precedence lets a caller steer which identity the server uses by adding a header. Precedence was kept because rejecting would break clients that legitimately send both; revisit if that trade stops holding.

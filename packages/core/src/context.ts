@@ -1,3 +1,4 @@
+import type { AuditEntry, RequestContext } from "./audit.js";
 import type { ActorApi, AuthKit, PrincipalKind, ResolvedPrincipal } from "./index.js";
 
 /** What a framework binding attaches to a request once its credentials are resolved. */
@@ -6,6 +7,16 @@ export interface AuthzContext {
     readonly kind: PrincipalKind | null;
     /** Whether the request carried a credential at all, however it resolved. */
     readonly credentialPresented: boolean;
+    /** What the binding could tell about the request, carried onto every audit row it writes. */
+    readonly requestContext: RequestContext | null;
+    /**
+     * Records a refusal against this request, with its principal and context already bound. A
+     * no-op when `audit.denials` is off, and it never throws -- a guard's answer must not depend
+     * on whether the log accepted the row.
+     */
+    recordDenial(
+        entry: Omit<AuditEntry, "actorPrincipalId" | "outcome" | "requestContext">,
+    ): Promise<void>;
     /** Every scope held at a tenant. Memoized per request, per tenant. */
     scopes(tenantId: string): Promise<ReadonlySet<string>>;
     has(tenantId: string, scope: string): Promise<boolean>;
@@ -27,6 +38,7 @@ export interface AuthzContext {
 export function createAuthzContext(
     kit: AuthKit,
     { principalId, kind, credentialPresented }: ResolvedPrincipal,
+    requestContext: RequestContext | null = null,
 ): AuthzContext {
     // Promises, not resolved values: five concurrent has() calls in one tick must coalesce
     // into a single query. Caching the value only dedupes sequential calls.
@@ -52,7 +64,18 @@ export function createAuthzContext(
         principalId,
         kind,
         credentialPresented,
+        requestContext,
         scopes,
+
+        // Routed through the kit rather than through `as`, because the denial worth recording
+        // most is the one from a request with no principal to bind -- a credential that
+        // verified and maps to nobody. There is no ActorApi in that state.
+        recordDenial: entry =>
+            kit.logDenial({
+                ...entry,
+                actorPrincipalId: principalId,
+                requestContext,
+            }),
 
         // Answered from the memoized set rather than authz.has_scope. The two are equivalent
         // by construction -- has_scope is an EXISTS over effective_scopes, the same traversal
@@ -61,6 +84,6 @@ export function createAuthzContext(
         // happens only in SQL.
         has: async (tenantId, scope) => (await scopes(tenantId)).has(scope),
 
-        as: principalId === null ? null : kit.as(principalId),
+        as: principalId === null ? null : kit.as(principalId, requestContext),
     };
 }

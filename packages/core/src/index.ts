@@ -1,3 +1,11 @@
+import {
+    logAudit,
+    pruneAuditLogs,
+    type AuditEntry,
+    type PruneOptions,
+    type PruneResult,
+    type RequestContext,
+} from "./audit.js";
 import { effectiveScopes, hasScope } from "./authorize.js";
 import { rethrowAsAuthKitError } from "./errors.js";
 import {
@@ -20,7 +28,16 @@ import { createWriteApi, type WriteApi } from "./writes.js";
 
 export type { QueryFn, Row } from "./query.js";
 export type { JwtOptions, VerifyBearer } from "./identity.js";
-export type { WriteApi } from "./writes.js";
+export type { WriteApi, WriteApiOptions } from "./writes.js";
+export type {
+    AuditEntry,
+    AuditFilter,
+    AuditLogRow,
+    AuditOutcome,
+    PruneOptions,
+    PruneResult,
+    RequestContext,
+} from "./audit.js";
 export type {
     ApiKeyRow,
     Page,
@@ -134,6 +151,27 @@ export interface AuthKitOptions {
      * `supabase.auth.getUser(token)`, an upstream gateway -- so verification is not done twice.
      */
     verifyBearer?: VerifyBearer;
+    /** Audit logging. Successful writes log themselves in SQL regardless of what is set here. */
+    audit?: AuditOptions;
+}
+
+export interface AuditOptions {
+    /**
+     * Whether a refusal records a denied row -- both a write the SQL guards refused and a
+     * request a scope guard turned away. Default true.
+     *
+     * This is the only part of audit logging that is optional, because it is the only part
+     * that costs a round trip on a path that would otherwise make none, and the only part that
+     * a caller can drive: a public endpoint behind a scope guard writes one row per probe.
+     * Successful writes log inside the transaction they are already in and cannot be turned off.
+     */
+    denials?: boolean | undefined;
+    /**
+     * Called when writing an audit row itself fails. Audit writes never reject -- a logging
+     * failure must not become the caller's problem, least of all on a path that is already
+     * reporting a denial -- so this is the only way to find out that one did.
+     */
+    onError?: ((error: unknown) => void) | undefined;
 }
 
 export interface AuthKit {
@@ -156,8 +194,43 @@ export interface AuthKit {
     /**
      * The read and write APIs with this actor pre-bound. Take it once per request, from the
      * resolved principal, so the wrong actor cannot be threaded into a call by hand.
+     *
+     * `requestContext` is bound the same way and for the same reason: every audit row the
+     * writes produce carries the request that caused it, without any call site remembering to
+     * pass it.
      */
-    as(actorPrincipalId: string): ActorApi;
+    as(
+        actorPrincipalId: string,
+        requestContext?: RequestContext | null,
+    ): ActorApi;
+    /**
+     * Appends an audit row as any actor, including none. Resolves to the row's id, or null if
+     * the write failed -- it never rejects.
+     *
+     * `kit.as(actor).logAudit` is the form to prefer; this one exists for what has no actor to
+     * bind, which in practice means a request that presented a credential resolving to no
+     * principal.
+     */
+    logAudit(entry: AuditEntry): Promise<string | null>;
+    /**
+     * Records a refusal, unless `audit.denials` is off. The guard calls this; so does anything
+     * else that decides a caller may not do something.
+     */
+    logDenial(entry: Omit<AuditEntry, "outcome">): Promise<void>;
+    /**
+     * Deletes one batch of audit rows older than `before`.
+     *
+     * **On the kit rather than on `as(actor)`, because no principal does this.** Retention is a
+     * maintenance job: a cron worker has no principal to name, and the SQL function takes no
+     * actor and checks no scope -- authority is the connection, as it is for the other operator
+     * tools. Reaching it therefore means holding the owner connection or the secret key.
+     *
+     * Safe to run on every replica of a service. An advisory lock single-flights it, and a
+     * caller that does not get the lock comes back with `lock_acquired: false` having examined
+     * nothing -- which is not the same as having found nothing to delete, and a loop must treat
+     * the two differently.
+     */
+    pruneAuditLogs(options: PruneOptions): Promise<PruneResult>;
 }
 
 /** Everything that acts as a principal: the writes, and the reads that answer as that principal. */
@@ -205,6 +278,9 @@ export function createAuthKit(options: AuthKitOptions): AuthKit {
             "createAuthKit requires either `jwt` or `verifyBearer`",
         );
     }
+
+    const auditDenials = options.audit?.denials ?? true;
+    const onAuditError = options.audit?.onError;
 
     return {
         verifyBearer,
@@ -258,9 +334,25 @@ export function createAuthKit(options: AuthKitOptions): AuthKit {
         effectiveScopes: (principalId, tenantId) =>
             effectiveScopes(transport, principalId, tenantId),
 
-        as: actorPrincipalId => ({
-            ...createWriteApi(transport, actorPrincipalId),
+        as: (actorPrincipalId, requestContext = null) => ({
+            ...createWriteApi(transport, actorPrincipalId, {
+                requestContext,
+                auditDenials,
+                onAuditError,
+            }),
             ...createReadApi(transport, actorPrincipalId),
         }),
+
+        logAudit: entry => logAudit(transport, entry, onAuditError),
+
+        async logDenial(entry) {
+            if (!auditDenials) {
+                return;
+            }
+
+            await logAudit(transport, { ...entry, outcome: "denied" }, onAuditError);
+        },
+
+        pruneAuditLogs: options => pruneAuditLogs(transport, options),
     };
 }

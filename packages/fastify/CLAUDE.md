@@ -54,4 +54,12 @@ Guard errors need no setup. They carry `status` and `code`, which Fastify's defa
 - **No identity is zero scopes.** See the guard section; the SQL is already fail-closed and the adapter must not turn the null into a 500 or skip the check.
 - **Authorization is per (principal, tenant, scope)**, scope names are SQL identifiers used verbatim, and the traversal lives only in SQL.
 
+## Request context for audit rows
+
+The `onRequest` hook builds a `RequestContext` and passes it to `createAuthzContext`, which binds it alongside the actor so every audit row a request writes carries it. `requestContextFromFastify` is the default and is exported; the `requestContext` option replaces it, and returning `null` records rows with no request metadata.
+
+Fastify can be exact where Express cannot: `request.id` is Fastify's own (honouring `requestIdHeader`), so nothing has to be generated and the row correlates with Fastify's logs, and `request.routeOptions.url` is the matched **pattern**, so rows group by route rather than by every distinct path. It is undefined for a request that matched no route, where the raw URL is the honest answer. `request.ip` honours `trustProxy`.
+
+The denial rows themselves come from the core's `enforceGuard` — see `packages/core/CLAUDE.md` — so both adapters record the same two 403 branches and neither records the 401.
+
 `verify_api_key` writes `last_used_at`, and the hook runs for every request in the plugin's context — public routes included — so API-key auth costs one row write per request. Core's `resolvePrincipal` guarantees it is never more than one.
