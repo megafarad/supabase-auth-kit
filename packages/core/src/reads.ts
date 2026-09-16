@@ -1,3 +1,4 @@
+import type { AuditFilter, AuditLogRow } from "./audit.js";
 import { AuthzUsageError } from "./errors.js";
 import type { Row } from "./query.js";
 import type { AuthzFunction, AuthzTransport, RpcArgs } from "./transport.js";
@@ -163,6 +164,19 @@ export interface ReadApi {
 
     /** API keys issued at the tenant, revoked ones included. Needs `authz.api_keys.read` there. */
     listApiKeys(tenantId: string, page?: PageOptions): Promise<Page<ApiKeyRow>>;
+
+    /**
+     * The audit trail, newest first, filtered to what the actor may see: rows at tenants where
+     * they hold `authz.audit.read`, and tenantless rows -- platform-level actions -- only with
+     * that scope at the master.
+     *
+     * Every filter is optional, and **omitting `tenantId` is not "no tenant" but "everything
+     * you may read"**, which is how a subtree is listed: authority at a tenant covers its
+     * descendants' rows, since `has_scope` resolves through the ancestor chain.
+     */
+    listAuditLogs(
+        filter?: AuditFilter & PageOptions,
+    ): Promise<Page<AuditLogRow>>;
 }
 
 const DEFAULT_LIMIT = 100;
@@ -256,7 +270,33 @@ export function createReadApi(
 
         listApiKeys: (tenantId, options) =>
             page("list_api_keys", { p_tenant_id: tenantId }, options),
+
+        listAuditLogs: filter =>
+            page(
+                "list_audit_logs",
+                {
+                    p_tenant_id: filter?.tenantId ?? null,
+                    p_actor_id: filter?.actorPrincipalId ?? null,
+                    p_action: filter?.action ?? null,
+                    p_target_type: filter?.targetType ?? null,
+                    p_target_id: filter?.targetId ?? null,
+                    p_request_id: filter?.requestId ?? null,
+                    p_outcome: filter?.outcome ?? null,
+                    p_from: timestamp(filter?.from),
+                    p_to: timestamp(filter?.to),
+                },
+                filter,
+            ),
     };
+}
+
+/** As in `writes.ts`: one explicit form, so both transports send the same string. */
+function timestamp(value: Date | string | null | undefined): string | null {
+    if (value === null || value === undefined) {
+        return null;
+    }
+
+    return value instanceof Date ? value.toISOString() : value;
 }
 
 function stripCursor(row: Row): Row {

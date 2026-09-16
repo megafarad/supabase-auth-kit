@@ -486,6 +486,268 @@ comment on function authz.current_principal_id() is
     'The principal behind the current JWT, or null when there is none. Delegates to principal_for_auth_user.';
 
 
+-- ---------------------------------------------------------------------------------------
+-- Audit log
+--
+-- One writer, and it is this function. Every mutating function below calls it before
+-- returning, inside its own transaction, so the row and the change it describes commit or
+-- roll back together -- which a second round trip from the caller could never guarantee.
+--
+-- That same atomicity is why a refusal cannot be logged here. Every guard signals with
+-- `raise exception`, which rolls the transaction back and takes any audit row inserted along
+-- the way with it, and Postgres has no autonomous transaction to escape that. Denied rows are
+-- therefore written by the caller after the fact, through this same function with
+-- p_outcome => 'denied'.
+--
+-- There is no authz.audit.write scope, deliberately: nothing should be able to write audit
+-- rows by virtue of holding a role. Under posture A only the server reaches authz at all, and
+-- whoever holds that connection is already trusted to name any actor.
+--
+-- p_request_ctx carries the HTTP context as one jsonb rather than five parameters. A session
+-- GUC was not an option: the supabase-js transport cannot set one in the same transaction as
+-- the RPC it wraps, and the two transports have to stay indistinguishable. One jsonb also
+-- means the next context field added is not another signature change across thirteen
+-- functions. Recognised keys: request_id, method, route, ip, user_agent; anything else is
+-- ignored.
+create or replace function authz.log_audit(p_actor_principal_id uuid,
+                                           p_tenant_id uuid,
+                                           p_action text,
+                                           p_target_type text,
+                                           p_target_id uuid default null,
+                                           p_before jsonb default null,
+                                           p_after jsonb default null,
+                                           p_outcome text default 'success',
+                                           p_reason text default null,
+                                           p_request_ctx jsonb default null)
+    returns uuid
+    language plpgsql
+    security definer
+    set search_path = ''
+as $$
+declare
+    v_id     uuid := gen_random_uuid();
+    v_actor  uuid;
+    v_tenant uuid;
+    v_kind   authz.principal_kind;
+begin
+    -- Nothing in this function may raise. It runs inside the transaction of the write it
+    -- describes, so anything that fails here fails the write itself -- a grant lost to a
+    -- malformed audit row would be the logging making the system less correct, not more.
+    -- Hence both foreign keys are resolved rather than trusted, and the two NOT NULL text
+    -- columns and the outcome check are satisfied by construction below.
+    --
+    -- Resolving rather than trusting matters most for denials, which are logged for exactly
+    -- the input that caused them -- often a tenant id the caller invented. A foreign key
+    -- violation there would turn a clean 403 into a 500. The unresolvable value is not lost:
+    -- a denial records what was asked about as the target, which carries no foreign key.
+    select p.id, p.kind into v_actor, v_kind
+      from authz.principals p
+     where p.id = p_actor_principal_id;
+
+    select t.id into v_tenant
+      from authz.tenants t
+     where t.id = p_tenant_id;
+
+    insert into authz.audit_logs (id, actor_principal_id, actor_kind,
+                                  request_id, method, route,
+                                  action, target_type, target_id, tenant_id,
+                                  outcome, reason, before, after, ip, user_agent)
+    values (v_id, v_actor, v_kind::text,
+            p_request_ctx ->> 'request_id',
+            p_request_ctx ->> 'method',
+            p_request_ctx ->> 'route',
+            coalesce(p_action, 'unknown'),
+            coalesce(p_target_type, 'unknown'),
+            p_target_id, v_tenant,
+            case when p_outcome = 'denied' then 'denied' else 'success' end,
+            p_reason, p_before, p_after,
+            p_request_ctx ->> 'ip',
+            p_request_ctx ->> 'user_agent');
+
+    return v_id;
+end;
+$$;
+
+comment on function authz.log_audit(uuid, uuid, text, text, uuid, jsonb, jsonb, text, text, jsonb) is
+    'Appends one row to the audit log. Called by the mutating functions inside their own transaction, and by the caller for refusals, which cannot be logged from inside the function that raises.';
+
+
+-- The audit trail, newest first.
+--
+-- Visibility is the audit_logs policy exactly: a row is readable by an actor holding
+-- authz.audit.read at the row's own tenant, and a row with no tenant -- a platform-level
+-- action -- at the master. Because has_scope resolves through the ancestor chain, authority
+-- at a tenant also covers its descendants' rows, so an operator at the master sees everything
+-- and a tenant admin sees their own subtree.
+--
+-- p_tenant_id therefore narrows rather than widens: leaving it null returns every row the
+-- actor may see, which is how a subtree is read. It also decides the cost. The set of
+-- readable tenants is computed once, per tenant, in a MATERIALIZED CTE -- the rule
+-- list_tenant_bindings follows for the same reason -- because has_scope inlined into the row
+-- filter would be one ancestor walk per row of history rather than per tenant. Filtering to a
+-- single tenant collapses that CTE to one check.
+create or replace function authz.list_audit_logs(p_actor_principal_id uuid,
+                                                 p_tenant_id uuid default null,
+                                                 p_actor_id uuid default null,
+                                                 p_action text default null,
+                                                 p_target_type text default null,
+                                                 p_target_id uuid default null,
+                                                 p_request_id text default null,
+                                                 p_outcome text default null,
+                                                 p_from timestamptz default null,
+                                                 p_to timestamptz default null,
+                                                 p_limit integer default 100,
+                                                 p_after text default null)
+    returns table (audit_log_id uuid, actor_principal_id uuid, actor_kind text,
+                   request_id text, method text, route text, action text,
+                   target_type text, target_id uuid, tenant_id uuid,
+                   outcome text, reason text, before jsonb, after jsonb,
+                   ip text, user_agent text, created_at timestamptz, page_cursor text)
+    language sql
+    stable
+    security definer
+    set search_path = ''
+as $$
+with readable as materialized (
+    select t.id
+      from authz.tenants t
+     where (p_tenant_id is null or t.id = p_tenant_id)
+       and authz.has_scope(p_actor_principal_id, t.id, 'authz.audit.read')
+),
+platform as materialized (
+    -- The coalesce in the audit_logs policy, spelled out: a row with no tenant requires
+    -- audit.read at the master. Excluded outright when a tenant filter is given, since such
+    -- a row belongs to no tenant.
+    select p_tenant_id is null
+       and authz.has_scope(p_actor_principal_id, authz.master_tenant_id(),
+                           'authz.audit.read') as visible
+)
+select a.id, a.actor_principal_id, a.actor_kind, a.request_id, a.method, a.route,
+       a.action, a.target_type, a.target_id, a.tenant_id, a.outcome, a.reason,
+       a.before, a.after, a.ip, a.user_agent, a.created_at,
+       a.id::text || a.created_at::text
+  from authz.audit_logs a
+ where case
+           when a.tenant_id is null then (select p.visible from platform p)
+           else a.tenant_id in (select r.id from readable r)
+       end
+   and (p_actor_id is null or a.actor_principal_id = p_actor_id)
+   and (p_action is null or a.action = p_action)
+   and (p_target_type is null or a.target_type = p_target_type)
+   and (p_target_id is null or a.target_id = p_target_id)
+   and (p_request_id is null or a.request_id = p_request_id)
+   and (p_outcome is null or a.outcome = p_outcome)
+   and (p_from is null or a.created_at >= p_from)
+   and (p_to is null or a.created_at < p_to)
+   -- Descending keyset, so the cursor comparison is < rather than >. The cursor is still the
+   -- row's id followed by its sort key: an id is always 36 characters, which is what lets the
+   -- two halves be split without a delimiter.
+   and (p_after is null
+        or (a.created_at, a.id)
+           < (substr(p_after, 37)::timestamptz, substr(p_after, 1, 36)::uuid))
+ order by a.created_at desc, a.id desc
+ limit least(greatest(coalesce(p_limit, 100), 1), 1000);
+$$;
+
+comment on function authz.list_audit_logs(uuid, uuid, uuid, text, text, uuid, text, text, timestamptz, timestamptz, integer, text) is
+    'The audit trail visible to an actor, newest first: rows at tenants where they hold authz.audit.read, and tenantless rows if they hold it at the master. Every filter is optional.';
+
+
+-- Deletes audit rows older than a cutoff. One batch per call.
+--
+-- **Takes no actor, and checks no scope**, which is deliberate and is the only write in the
+-- schema shaped this way. Retention is a maintenance job, not something a principal does: a
+-- cron worker has no principal to name, the model has no system principal to invent --
+-- principals_exactly_one_of forbids one -- and passing null would simply fail every check,
+-- since has_scope(null, ...) is false. Naming some real principal instead would put a lie in
+-- the audit row. So authority here is holding the server's credentials, which is what
+-- provision_admin and reclaim_identity already rely on under posture A.
+--
+-- Unlike those two it *is* granted to service_role, because a supabase-js deployment has no
+-- other way to reach it and would otherwise have no retention at all. That grants nothing new:
+-- a secret key can already call grant_role naming any actor, so it is total authority over this
+-- schema already. Never grant this to anon or authenticated -- there it would be an erase-your-
+-- own-trail primitive for any caller.
+--
+-- Concurrency, for a job that runs on every replica of a service:
+--
+--   * A transaction-scoped advisory lock single-flights the prune, so replicas do not duplicate
+--     each other's scans. Transaction-scoped, so it is released on commit and cannot leak if a
+--     pod dies holding it. One call is one transaction, so a loop of batches releases and
+--     retakes it between batches and no replica starves. The key includes the tenant filter, so
+--     a per-tenant prune and a global one do not serialise against each other unnecessarily.
+--   * FOR UPDATE SKIP LOCKED on the batch selection handles whatever the lock does not: a prune
+--     running from the SQL editor, or the per-tenant and global cases overlapping on the same
+--     rows. Each caller takes a disjoint batch rather than blocking on the other's row locks.
+--
+-- A caller that does not get the lock gets `lock_acquired = false` and zero deleted, which is
+-- how a `while (deleted > 0)` loop tells "someone else is doing it" from "there is nothing
+-- left" -- the two are the same row count and must not be the same answer.
+create or replace function authz.prune_audit_logs(p_before timestamptz,
+                                                  p_tenant_id uuid default null,
+                                                  p_limit integer default 1000)
+    returns table (deleted_count integer, lock_acquired boolean)
+    language plpgsql
+    security definer
+    set search_path = ''
+as $$
+declare
+    v_deleted integer;
+begin
+    -- No default cutoff, ever. This is the one function here that destroys history, and an
+    -- argument the caller forgot must not mean "everything".
+    if p_before is null then
+        raise exception 'prune_audit_logs requires an explicit cutoff';
+    end if;
+
+    if not pg_try_advisory_xact_lock(
+               hashtext('authz.prune_audit_logs:' || coalesce(p_tenant_id::text, '*'))) then
+        return query select 0::integer, false;
+
+        return;
+    end if;
+
+    with doomed as (
+        select a.id
+          from authz.audit_logs a
+         where a.created_at < p_before
+           and (p_tenant_id is null or a.tenant_id = p_tenant_id)
+           -- Prune records are never pruned. They are the record of what was destroyed, which
+           -- is the one thing that has to outlive the destruction -- otherwise a trail with a
+           -- hole in it is indistinguishable from a trail that never had those rows. One row
+           -- per prune that actually deleted something, so this exemption stays small.
+           and a.action <> 'prune_audit_logs'
+         order by a.created_at
+         limit greatest(coalesce(p_limit, 1000), 1)
+           for update skip locked
+    )
+    delete from authz.audit_logs a
+     using doomed d
+     where a.id = d.id;
+
+    get diagnostics v_deleted = row_count;
+
+    -- Logged only when something was actually deleted. A retention job that runs every five
+    -- minutes on three replicas and finds nothing would otherwise write more rows than it
+    -- removes. The row is written after the delete, so its own created_at is later than any
+    -- cutoff this call could have used and it cannot delete its own record.
+    if v_deleted > 0 then
+        perform authz.log_audit(null, p_tenant_id,
+                                'prune_audit_logs', 'audit_log', null,
+                                null,
+                                jsonb_build_object('before', p_before,
+                                                   'tenant_id', p_tenant_id,
+                                                   'deleted_count', v_deleted),
+                                'success', null, null);
+    end if;
+
+    return query select v_deleted, true;
+end;
+$$;
+
+comment on function authz.prune_audit_logs(timestamptz, uuid, integer) is
+    'Deletes one batch of audit rows older than a cutoff, single-flighted across replicas by an advisory lock. Takes no actor: retention is a maintenance job, and authority is the connection. Never deletes its own prune records.';
+
 -- Binds a principal to a role at a tenant. The general grant primitive: invite_user layers
 -- the email/identity handling on top of this, and it is the only way to grant anything to an
 -- api_key principal, which has no address to invite.
@@ -493,7 +755,8 @@ create or replace function authz.grant_role(p_actor_principal_id uuid,
                                             p_principal_id uuid,
                                             p_role_id uuid,
                                             p_tenant_id uuid,
-                                            p_expires_at timestamptz default null)
+                                            p_expires_at timestamptz default null,
+                                            p_request_ctx jsonb default null)
     returns uuid
     language plpgsql
     security definer
@@ -505,6 +768,7 @@ declare
     v_kind         authz.principal_kind;
     v_claimed_at   timestamptz;
     v_auth_user_id uuid;
+    v_before       jsonb;
 begin
     select p.kind, u.claimed_at, u.auth_user_id
       into v_kind, v_claimed_at, v_auth_user_id
@@ -563,6 +827,20 @@ begin
             p_principal_id;
     end if;
 
+    -- Read before writing, for the audit row only. A grant that reinstates a revoked binding
+    -- and a grant that creates one are the same call and the same return value, and which of
+    -- the two happened is exactly what an auditor is reading the log to find out. One lookup
+    -- on the unique key that the upsert below is about to use anyway.
+    select jsonb_build_object('binding_id', rb.id,
+                              'granted_at', rb.granted_at,
+                              'expires_at', rb.expires_at,
+                              'revoked_at', rb.revoked_at)
+      into v_before
+      from authz.role_bindings rb
+     where rb.principal_id = p_principal_id
+       and rb.role_id = p_role_id
+       and rb.tenant_id = p_tenant_id;
+
     -- Upsert, not on-conflict-do-nothing. (principal_id, role_id, tenant_id) is unique
     -- whether or not the binding is revoked, so do-nothing would make re-granting a
     -- previously revoked role a silent no-op: the caller would believe access was restored
@@ -582,11 +860,20 @@ begin
            updated_at              = now()
     returning id into v_binding_id;
 
+    perform authz.log_audit(p_actor_principal_id, p_tenant_id,
+                            'grant_role', 'role_binding', v_binding_id,
+                            v_before,
+                            jsonb_build_object('principal_id', p_principal_id,
+                                               'role_id', p_role_id,
+                                               'tenant_id', p_tenant_id,
+                                               'expires_at', p_expires_at),
+                            'success', null, p_request_ctx);
+
     return v_binding_id;
 end;
 $$;
 
-comment on function authz.grant_role(uuid, uuid, uuid, uuid, timestamptz) is
+comment on function authz.grant_role(uuid, uuid, uuid, uuid, timestamptz, jsonb) is
     'Binds a principal to a role at a tenant, reinstating a revoked binding if one exists. Requires authz.bindings.grant and every scope the role confers.';
 
 
@@ -605,7 +892,8 @@ comment on function authz.grant_role(uuid, uuid, uuid, uuid, timestamptz) is
 create or replace function authz.invite_user(p_actor_principal_id uuid,
                                              p_tenant_id uuid,
                                              p_email text,
-                                             p_role_id uuid)
+                                             p_role_id uuid,
+                                             p_request_ctx jsonb default null)
     returns uuid
     language plpgsql
     security definer
@@ -616,6 +904,7 @@ declare
     v_principal_id uuid;
     v_claimed_at   timestamptz;
     v_auth_user_id uuid;
+    v_provisioned  boolean := false;
 begin
     -- Pre-flight, even though grant_role checks this again and is authoritative. It has to
     -- come before the identity lookup below: the retired-identity error names an address, so
@@ -634,6 +923,7 @@ begin
 
     if v_user_id is null then
         v_user_id := gen_random_uuid();
+        v_provisioned := true;
 
         insert into authz.users (id, auth_user_id, email_id, email)
         values (v_user_id, null, authz.email_id(p_email), p_email);
@@ -658,14 +948,31 @@ begin
     end if;
 
     -- Everything from here is generic, so it lives in grant_role: authority, role
-    -- visibility, the holds-it rule, and reinstating a revoked binding.
-    perform authz.grant_role(p_actor_principal_id, v_principal_id, p_role_id, p_tenant_id);
+    -- visibility, the holds-it rule, and reinstating a revoked binding. The request context
+    -- travels with it, so the grant_role row it writes belongs to the same request as this
+    -- one -- an invite leaves two rows, which is the truth: an identity decision and a grant.
+    perform authz.grant_role(p_actor_principal_id, v_principal_id, p_role_id, p_tenant_id,
+                             null, p_request_ctx);
+
+    -- The address is recorded, which is the one place an audit row carries PII by design:
+    -- the action *is* the address. It outlives the account deliberately -- deleting the
+    -- Supabase user unlinks the identity and leaves the trail intact -- so an erasure request
+    -- reaches this table and is not satisfied by deleting the auth.users row.
+    perform authz.log_audit(p_actor_principal_id, p_tenant_id,
+                            'invite_user', 'user', v_user_id,
+                            null,
+                            jsonb_build_object('email', p_email,
+                                               'role_id', p_role_id,
+                                               'tenant_id', p_tenant_id,
+                                               'principal_id', v_principal_id,
+                                               'provisioned', v_provisioned),
+                            'success', null, p_request_ctx);
 
     return v_user_id;
 end;
 $$;
 
-comment on function authz.invite_user(uuid, uuid, text, uuid) is
+comment on function authz.invite_user(uuid, uuid, text, uuid, jsonb) is
     'Binds an email address to a role at a tenant, provisioning an unclaimed identity if that person has no account yet. Requires authz.bindings.grant and every scope the role confers.';
 
 
@@ -684,7 +991,8 @@ create or replace function authz.create_role(p_actor_principal_id uuid,
                                              p_tenant_id uuid,
                                              p_name text,
                                              p_description text,
-                                             p_crosses_boundary boolean default false)
+                                             p_crosses_boundary boolean default false,
+                                             p_request_ctx jsonb default null)
     returns uuid
     language plpgsql
     security definer
@@ -712,11 +1020,20 @@ begin
     values (v_role_id, p_tenant_id, p_name, p_description,
             coalesce(p_crosses_boundary, false));
 
+    perform authz.log_audit(p_actor_principal_id, p_tenant_id,
+                            'create_role', 'role', v_role_id,
+                            null,
+                            jsonb_build_object('name', p_name,
+                                               'description', p_description,
+                                               'crosses_boundary',
+                                               coalesce(p_crosses_boundary, false)),
+                            'success', null, p_request_ctx);
+
     return v_role_id;
 end;
 $$;
 
-comment on function authz.create_role(uuid, uuid, text, text, boolean) is
+comment on function authz.create_role(uuid, uuid, text, text, boolean, jsonb) is
     'Creates a role at a tenant. Ordinary roles need authz.roles.write there; setting crosses_boundary additionally requires authz.roles.write at the master tenant.';
 
 
@@ -728,7 +1045,8 @@ create or replace function authz.update_role(p_actor_principal_id uuid,
                                              p_role_id uuid,
                                              p_name text default null,
                                              p_description text default null,
-                                             p_crosses_boundary boolean default null)
+                                             p_crosses_boundary boolean default null,
+                                             p_request_ctx jsonb default null)
     returns void
     language plpgsql
     security definer
@@ -737,9 +1055,12 @@ as $$
 declare
     v_tenant_id uuid;
     v_current   boolean;
+    v_before    jsonb;
 begin
-    select r.tenant_id, r.crosses_boundary
-      into v_tenant_id, v_current
+    select r.tenant_id, r.crosses_boundary,
+           jsonb_build_object('name', r.name, 'description', r.description,
+                              'crosses_boundary', r.crosses_boundary)
+      into v_tenant_id, v_current, v_before
       from authz.roles r
      where r.id = p_role_id;
 
@@ -773,10 +1094,20 @@ begin
            crosses_boundary = coalesce(p_crosses_boundary, r.crosses_boundary),
            updated_at       = now()
      where r.id = p_role_id;
+
+    perform authz.log_audit(p_actor_principal_id, v_tenant_id,
+                            'update_role', 'role', p_role_id,
+                            v_before,
+                            (select jsonb_build_object('name', r.name,
+                                                       'description', r.description,
+                                                       'crosses_boundary', r.crosses_boundary)
+                               from authz.roles r
+                              where r.id = p_role_id),
+                            'success', null, p_request_ctx);
 end;
 $$;
 
-comment on function authz.update_role(uuid, uuid, text, text, boolean) is
+comment on function authz.update_role(uuid, uuid, text, text, boolean, jsonb) is
     'Amends a role in place; null arguments leave a column unchanged. Changing crosses_boundary in either direction requires authz.roles.write at the master tenant.';
 
 
@@ -788,7 +1119,8 @@ comment on function authz.update_role(uuid, uuid, text, text, boolean) is
 -- therefore only attach authority they already hold themselves.
 create or replace function authz.add_role_scope(p_actor_principal_id uuid,
                                                 p_role_id uuid,
-                                                p_scope_id uuid)
+                                                p_scope_id uuid,
+                                                p_request_ctx jsonb default null)
     returns void
     language plpgsql
     security definer
@@ -842,17 +1174,27 @@ begin
     insert into authz.role_scopes (role_id, scope_id)
     values (p_role_id, p_scope_id)
     on conflict do nothing;
+
+    -- Logged against the role, not the role_scopes pair: role_scopes has no id of its own,
+    -- and the role is what an auditor tracks -- attaching a scope widens every binding to it.
+    perform authz.log_audit(p_actor_principal_id, v_tenant_id,
+                            'add_role_scope', 'role', p_role_id,
+                            null,
+                            jsonb_build_object('scope_id', p_scope_id,
+                                               'scope_name', v_scope_name),
+                            'success', null, p_request_ctx);
 end;
 $$;
 
-comment on function authz.add_role_scope(uuid, uuid, uuid) is
+comment on function authz.add_role_scope(uuid, uuid, uuid, jsonb) is
     'Attaches a scope to a role. Requires authz.roles.write at the role''s tenant and that the actor already holds the scope being attached.';
 
 
 -- Detaches a scope from a role.
 create or replace function authz.remove_role_scope(p_actor_principal_id uuid,
                                                    p_role_id uuid,
-                                                   p_scope_id uuid)
+                                                   p_scope_id uuid,
+                                                   p_request_ctx jsonb default null)
     returns void
     language plpgsql
     security definer
@@ -880,10 +1222,18 @@ begin
     delete from authz.role_scopes rs
      where rs.role_id = p_role_id
        and rs.scope_id = p_scope_id;
+
+    -- The hard delete is exactly why `before` matters here: after this commits, the audit row
+    -- is the only record that the pair ever existed.
+    perform authz.log_audit(p_actor_principal_id, v_tenant_id,
+                            'remove_role_scope', 'role', p_role_id,
+                            jsonb_build_object('scope_id', p_scope_id),
+                            null,
+                            'success', null, p_request_ctx);
 end;
 $$;
 
-comment on function authz.remove_role_scope(uuid, uuid, uuid) is
+comment on function authz.remove_role_scope(uuid, uuid, uuid, jsonb) is
     'Detaches a scope from a role. Requires authz.roles.write at the role''s tenant; narrowing needs no holds-it check.';
 
 
@@ -933,7 +1283,8 @@ comment on function authz.principal_is_active(uuid) is
 -- opting out belongs in a later, deliberate edit.
 create or replace function authz.create_tenant(p_actor_principal_id uuid,
                                                p_parent_id uuid,
-                                               p_name text)
+                                               p_name text,
+                                               p_request_ctx jsonb default null)
     returns uuid
     language plpgsql
     security definer
@@ -954,11 +1305,19 @@ begin
     insert into authz.tenants (id, parent_id, name)
     values (v_tenant_id, p_parent_id, p_name);
 
+    -- Logged at the new tenant rather than the parent: that is where the row lives, and where
+    -- audit.read has to be held to read it. Authority at the parent reaches it either way.
+    perform authz.log_audit(p_actor_principal_id, v_tenant_id,
+                            'create_tenant', 'tenant', v_tenant_id,
+                            null,
+                            jsonb_build_object('parent_id', p_parent_id, 'name', p_name),
+                            'success', null, p_request_ctx);
+
     return v_tenant_id;
 end;
 $$;
 
-comment on function authz.create_tenant(uuid, uuid, text) is
+comment on function authz.create_tenant(uuid, uuid, text, jsonb) is
     'Creates a child tenant under a parent where the actor holds authz.tenants.write. Grants nothing: the actor''s existing binding already reaches the new child.';
 
 
@@ -974,7 +1333,8 @@ comment on function authz.create_tenant(uuid, uuid, text) is
 -- A workspace is always a child of the master, because tenants_single_master_uq forbids a
 -- second root. Master is the platform and its children are the customers.
 create or replace function authz.create_workspace(p_actor_principal_id uuid,
-                                                  p_name text)
+                                                  p_name text,
+                                                  p_request_ctx jsonb default null)
     returns uuid
     language plpgsql
     security definer
@@ -1015,11 +1375,21 @@ begin
         p_actor_principal_id
     );
 
+    -- The one write with no scope check, so it is the one an auditor most wants to see. The
+    -- self-grant is part of the row: this is the only place authority appears from nowhere.
+    perform authz.log_audit(p_actor_principal_id, v_tenant_id,
+                            'create_workspace', 'tenant', v_tenant_id,
+                            null,
+                            jsonb_build_object('parent_id', v_master_id,
+                                               'name', p_name,
+                                               'self_granted_role_id', v_tenant_admin_id),
+                            'success', null, p_request_ctx);
+
     return v_tenant_id;
 end;
 $$;
 
-comment on function authz.create_workspace(uuid, text) is
+comment on function authz.create_workspace(uuid, text, jsonb) is
     'Creates a workspace under the master and self-grants tenant_admin to the caller. Has no scope check by design -- gating who may call it is the consumer''s policy decision.';
 
 
@@ -1042,7 +1412,8 @@ comment on function authz.create_workspace(uuid, text) is
 create or replace function authz.update_tenant(p_actor_principal_id uuid,
                                                p_tenant_id uuid,
                                                p_name text default null,
-                                               p_inherit boolean default null)
+                                               p_inherit boolean default null,
+                                               p_request_ctx jsonb default null)
     returns void
     language plpgsql
     security definer
@@ -1052,9 +1423,11 @@ declare
     v_parent_id uuid;
     v_current   boolean;
     v_found     boolean;
+    v_before    jsonb;
 begin
-    select true, t.parent_id, t.inherit
-      into v_found, v_parent_id, v_current
+    select true, t.parent_id, t.inherit,
+           jsonb_build_object('name', t.name, 'inherit', t.inherit)
+      into v_found, v_parent_id, v_current, v_before
       from authz.tenants t
      where t.id = p_tenant_id;
 
@@ -1088,10 +1461,20 @@ begin
            inherit    = coalesce(p_inherit, t.inherit),
            updated_at = now()
      where t.id = p_tenant_id;
+
+    -- A change to inherit is a change to who can see this tenant at all, so the before/after
+    -- pair is the record of when a subtree was cut off from its parent and by whom.
+    perform authz.log_audit(p_actor_principal_id, p_tenant_id,
+                            'update_tenant', 'tenant', p_tenant_id,
+                            v_before,
+                            (select jsonb_build_object('name', t.name, 'inherit', t.inherit)
+                               from authz.tenants t
+                              where t.id = p_tenant_id),
+                            'success', null, p_request_ctx);
 end;
 $$;
 
-comment on function authz.update_tenant(uuid, uuid, text, boolean) is
+comment on function authz.update_tenant(uuid, uuid, text, boolean, jsonb) is
     'Amends a tenant; null arguments leave a column unchanged. Renaming needs authz.tenants.write at the tenant, changing inherit needs it at the parent.';
 
 
@@ -1105,7 +1488,8 @@ comment on function authz.update_tenant(uuid, uuid, text, boolean) is
 -- Idempotent: revoking an already-revoked binding is a no-op rather than an error, and the
 -- original revoked_at is preserved so a retry cannot quietly rewrite when access ended.
 create or replace function authz.revoke_binding(p_actor_principal_id uuid,
-                                                p_binding_id uuid)
+                                                p_binding_id uuid,
+                                                p_request_ctx jsonb default null)
     returns void
     language plpgsql
     security definer
@@ -1115,9 +1499,14 @@ declare
     v_tenant_id  uuid;
     v_revoked_at timestamptz;
     v_found      boolean;
+    v_before     jsonb;
 begin
-    select true, rb.tenant_id, rb.revoked_at
-      into v_found, v_tenant_id, v_revoked_at
+    select true, rb.tenant_id, rb.revoked_at,
+           jsonb_build_object('principal_id', rb.principal_id,
+                              'role_id', rb.role_id,
+                              'tenant_id', rb.tenant_id,
+                              'revoked_at', rb.revoked_at)
+      into v_found, v_tenant_id, v_revoked_at, v_before
       from authz.role_bindings rb
      where rb.id = p_binding_id;
 
@@ -1139,10 +1528,21 @@ begin
                updated_at = now()
          where rb.id = p_binding_id;
     end if;
+
+    -- Logged even when the call was a no-op on an already-revoked binding. The attempt is
+    -- itself the interesting fact during an incident, and `before` says which it was: a row
+    -- whose before.revoked_at is already set changed nothing.
+    perform authz.log_audit(p_actor_principal_id, v_tenant_id,
+                            'revoke_binding', 'role_binding', p_binding_id,
+                            v_before,
+                            (select jsonb_build_object('revoked_at', rb.revoked_at)
+                               from authz.role_bindings rb
+                              where rb.id = p_binding_id),
+                            'success', null, p_request_ctx);
 end;
 $$;
 
-comment on function authz.revoke_binding(uuid, uuid) is
+comment on function authz.revoke_binding(uuid, uuid, jsonb) is
     'Revokes a role binding by timestamp. Requires authz.bindings.revoke at the binding''s own tenant; idempotent and never deletes.';
 
 
@@ -1156,7 +1556,8 @@ comment on function authz.revoke_binding(uuid, uuid) is
 create or replace function authz.create_scope(p_actor_principal_id uuid,
                                               p_tenant_id uuid,
                                               p_name text,
-                                              p_description text default null)
+                                              p_description text default null,
+                                              p_request_ctx jsonb default null)
     returns uuid
     language plpgsql
     security definer
@@ -1183,11 +1584,18 @@ begin
     insert into authz.scopes (id, tenant_id, name, description)
     values (v_scope_id, p_tenant_id, p_name, p_description);
 
+    perform authz.log_audit(p_actor_principal_id, p_tenant_id,
+                            'create_scope', 'scope', v_scope_id,
+                            null,
+                            jsonb_build_object('name', p_name,
+                                               'description', p_description),
+                            'success', null, p_request_ctx);
+
     return v_scope_id;
 end;
 $$;
 
-comment on function authz.create_scope(uuid, uuid, text, text) is
+comment on function authz.create_scope(uuid, uuid, text, text, jsonb) is
     'Defines a scope at a tenant. Requires authz.scopes.write there; the reserved authz. namespace additionally requires it at the master tenant.';
 
 
@@ -1196,7 +1604,8 @@ comment on function authz.create_scope(uuid, uuid, text, text) is
 create or replace function authz.create_api_key(p_actor_principal_id uuid,
                                                 p_tenant_id uuid,
                                                 p_label text,
-                                                p_expires_at timestamptz default null)
+                                                p_expires_at timestamptz default null,
+                                                p_request_ctx jsonb default null)
     returns text
     language plpgsql
     security definer
@@ -1242,11 +1651,22 @@ begin
     insert into authz.principals (id, kind, api_key_id)
     values (gen_random_uuid(), 'api_key', v_key_id);
 
+    -- Neither the key nor its hash goes in the audit row, for the same reason list_api_keys
+    -- does not return key_hash: a path that cannot carry it cannot leak it. The prefix is the
+    -- public half and is what identifies the key in every other view.
+    perform authz.log_audit(p_actor_principal_id, p_tenant_id,
+                            'create_api_key', 'api_key', v_key_id,
+                            null,
+                            jsonb_build_object('label', p_label,
+                                               'key_prefix', v_prefix,
+                                               'expires_at', p_expires_at),
+                            'success', null, p_request_ctx);
+
     return v_key;
 end;
 $$;
 
-comment on function authz.create_api_key(uuid, uuid, text, timestamptz) is
+comment on function authz.create_api_key(uuid, uuid, text, timestamptz, jsonb) is
     'Issues an API key at a tenant and returns the plaintext once. Requires authz.api_keys.write and a user principal as the actor.';
 
 
@@ -1315,7 +1735,8 @@ comment on function authz.verify_api_key(text) is
 -- because effective_bindings filters on api_keys.revoked_at -- there is no need to unwind
 -- the grants separately.
 create or replace function authz.revoke_api_key(p_actor_principal_id uuid,
-                                                p_api_key_id uuid)
+                                                p_api_key_id uuid,
+                                                p_request_ctx jsonb default null)
     returns void
     language plpgsql
     security definer
@@ -1325,9 +1746,12 @@ declare
     v_tenant_id  uuid;
     v_revoked_at timestamptz;
     v_found      boolean;
+    v_before     jsonb;
 begin
-    select true, k.tenant_id, k.revoked_at
-      into v_found, v_tenant_id, v_revoked_at
+    select true, k.tenant_id, k.revoked_at,
+           jsonb_build_object('label', k.label, 'key_prefix', k.key_prefix,
+                              'revoked_at', k.revoked_at)
+      into v_found, v_tenant_id, v_revoked_at, v_before
       from authz.api_keys k
      where k.id = p_api_key_id;
 
@@ -1346,10 +1770,20 @@ begin
                updated_at = now()
          where k.id = p_api_key_id;
     end if;
+
+    -- Revoking a key withdraws everything its principal held, without touching a binding, so
+    -- this row is the only trace of an authority change that leaves role_bindings untouched.
+    perform authz.log_audit(p_actor_principal_id, v_tenant_id,
+                            'revoke_api_key', 'api_key', p_api_key_id,
+                            v_before,
+                            (select jsonb_build_object('revoked_at', k.revoked_at)
+                               from authz.api_keys k
+                              where k.id = p_api_key_id),
+                            'success', null, p_request_ctx);
 end;
 $$;
 
-comment on function authz.revoke_api_key(uuid, uuid) is
+comment on function authz.revoke_api_key(uuid, uuid, jsonb) is
     'Revokes an API key by timestamp. Requires authz.api_keys.write at the key''s tenant; idempotent.';
 
 

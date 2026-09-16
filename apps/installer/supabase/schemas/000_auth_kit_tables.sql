@@ -113,24 +113,45 @@ CREATE TABLE "authz"."api_keys"
     "updated_at"         timestamptz DEFAULT now()            NOT NULL
 );
 
+-- Append-only. Rows are written by authz.log_audit and by nothing else: the mutating functions
+-- call it as part of their own transaction, so a logged change and the change itself commit or
+-- roll back together.
+--
+-- request_id, method and route are nullable although every HTTP caller has them, because a
+-- migration, a cron job or the SQL editor does not. Making them NOT NULL would mean a caller
+-- without request context could not log at all -- and since logging happens inside the write's
+-- transaction, a constraint violation there would roll back a legitimate grant. Audit logging
+-- must never be able to fail a write.
 CREATE TABLE "authz"."audit_logs"
 (
     "id"                 uuid PRIMARY KEY          NOT NULL,
     "actor_principal_id" uuid REFERENCES "authz".principals (id),
     "actor_kind"         text,
-    "request_id"         text                      NOT NULL,
-    "method"             text                      NOT NULL,
-    "route"              text                      NOT NULL,
+    "request_id"         text,
+    "method"             text,
+    "route"              text,
     "action"             text                      NOT NULL,
     "target_type"        text                      NOT NULL,
     "target_id"          uuid,
     "tenant_id"          uuid REFERENCES "authz".tenants (id),
+    -- A refusal is an audit event in its own right, and the one an audit log exists for. It
+    -- cannot be recorded from inside the function that refuses: every guard raises, which rolls
+    -- the transaction back, and Postgres has no autonomous transaction to escape that. Denied
+    -- rows are therefore written afterwards, from the caller, by log_audit.
+    "outcome"            text                      NOT NULL DEFAULT 'success'
+        CHECK ("outcome" IN ('success', 'denied')),
+    -- The refusal's message on a denial, null otherwise.
+    "reason"             text,
     "before"             jsonb,
     "after"              jsonb,
     "ip"                 text,
     "user_agent"         text,
-    "created_at"         timestamptz DEFAULT now() NOT NULL,
-    "updated_at"         timestamptz DEFAULT now() NOT NULL
+    -- The only table here with no updated_at, because it is the only one nothing amends. A
+    -- column that says "rows here get updated" is an affordance on an append-only table, and
+    -- it would sit at exactly equal to created_at forever. If rows ever do change -- redacting
+    -- an address out of before/after for an erasure request is the plausible case -- the column
+    -- to add is redacted_at, which says what happened rather than only that something did.
+    "created_at"         timestamptz DEFAULT now() NOT NULL
 );
 
 CREATE UNIQUE INDEX "api_keys_key_prefix_uq" ON "authz"."api_keys" using btree ("key_prefix");

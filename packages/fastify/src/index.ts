@@ -14,6 +14,7 @@ import {
     type AuthKitOptions,
     type AuthzContext,
     type GuardCheck,
+    type RequestContext,
     type TenantResolver as CoreTenantResolver,
 } from "@sirhc77/supabase-auth-kit-core";
 import type {
@@ -37,7 +38,14 @@ export {
     tenantFromParam,
     tenantFromQuery,
 } from "@sirhc77/supabase-auth-kit-core";
-export type { AuthKit, AuthzContext } from "@sirhc77/supabase-auth-kit-core";
+export type {
+    AuditEntry,
+    AuditFilter,
+    AuditLogRow,
+    AuthKit,
+    AuthzContext,
+    RequestContext,
+} from "@sirhc77/supabase-auth-kit-core";
 
 /**
  * Where a request says which tenant it concerns. The core's helpers (`tenantFromParam` and
@@ -71,6 +79,33 @@ export interface FastifyAuthKitOptions extends AuthKitOptions {
     resolveTenant: TenantResolver;
     /** Header carrying a plaintext API key. Defaults to `x-api-key`. */
     apiKeyHeader?: string;
+    /**
+     * What the audit rows written during a request should say about it. Defaults to
+     * `requestContextFromFastify`; return null to record nothing about the request itself.
+     */
+    requestContext?: (request: FastifyRequest) => RequestContext | null;
+}
+
+/**
+ * The default request context on Fastify, which can be exact where Express cannot.
+ *
+ * `request.id` is Fastify's own, so it is the id already in its logs -- honouring
+ * `requestIdHeader` when the caller sent one -- and nothing has to be generated. `routeOptions.url`
+ * is the matched **pattern** (`/tenants/:id/members`), so audit rows group by route rather than
+ * by every distinct path; it is undefined for a request that matched no route, where the raw URL
+ * is the honest answer.
+ *
+ * `request.ip` honours `trustProxy`, so a deployment behind a load balancer that has not set it
+ * will record the balancer's address.
+ */
+export function requestContextFromFastify(request: FastifyRequest): RequestContext {
+    return {
+        requestId: request.id,
+        method: request.method,
+        route: request.routeOptions?.url ?? request.url,
+        ip: request.ip,
+        userAgent: request.headers["user-agent"],
+    };
 }
 
 export interface GuardOptions {
@@ -129,7 +164,12 @@ export interface FastifyAuthKit {
 export function createFastifyAuthKit(
     options: FastifyAuthKitOptions,
 ): FastifyAuthKit {
-    const { resolveTenant, apiKeyHeader = "x-api-key", ...kitOptions } = options;
+    const {
+        resolveTenant,
+        apiKeyHeader = "x-api-key",
+        requestContext = requestContextFromFastify,
+        ...kitOptions
+    } = options;
     const kit = createAuthKit(kitOptions);
 
     /** The decision order lives in the core's `enforceGuard`; this only binds it to Fastify. */
@@ -153,7 +193,11 @@ export function createFastifyAuthKit(
                 credentialsFromHeaders(request.headers, apiKeyHeader),
             );
 
-            request.authKit = createAuthzContext(kit, resolved);
+            request.authKit = createAuthzContext(
+                kit,
+                resolved,
+                requestContext(request),
+            );
         });
     };
 

@@ -99,7 +99,7 @@ All tables live in a dedicated `authz` schema, separate from Supabase's `auth` a
 - **`role_bindings` is the grant record**: `(principal_id, role_id, tenant_id)` unique, with `granted_by_principal_id`, `granted_at`, `expires_at`, and `revoked_at`. Grants are revoked by timestamp, never deleted. The `tenant_id` is the *root* of the grant, not its full extent — the binding reaches every descendant of that tenant, so this table is read through the ancestor chain rather than by exact match.
 - **Soft deletion everywhere**: `disabled_at` / `deleted_at` / `revoked_at` columns, with indexes on them. Queries must filter these explicitly.
 - **`api_keys` stores `key_hash` (char(64), i.e. SHA-256 hex) plus a unique `key_prefix`** for lookup — the plaintext key is never stored. `users.email_id` is the same char(64) shape, a hash used as the unique lookup key alongside the plaintext `email`.
-- **`audit_logs` captures `before`/`after` jsonb** alongside request context (`request_id`, `method`, `route`, `ip`, `user_agent`).
+- **`audit_logs` captures `before`/`after` jsonb** alongside request context (`request_id`, `method`, `route`, `ip`, `user_agent`) and an `outcome` of `success` or `denied` with the refusal's `reason`. Append-only, written by `log_audit` and nothing else, and the one table with **no `updated_at`** — nothing amends an audit row, so the column would sit equal to `created_at` forever while advertising that rows here get updated. The three HTTP columns are **nullable**: a cron job or the SQL editor has no request, and since the row is written inside the transaction of the write it describes, a NOT NULL violation there would roll back a legitimate grant. See [Audit log](#audit-log).
 - **RLS is enabled on every table, with SELECT-only policies in `002_auth_kit_policies.sql`.** Any new table needs a matching `enable row level security` line and a policy, or it is deny-all.
 
 ## Access posture (decided: A, server-only)
@@ -172,6 +172,9 @@ The whole inherit/`crosses_boundary` rule lives in one place, `authz.tenant_chai
 | `list_roles` / `list_scopes(actor, tenant, limit, after)` | definitions in effect at a tenant, after shadowing |
 | `list_role_scopes(actor, tenant, role, limit, after)` | what a role in effect at a tenant confers |
 | `list_api_keys(actor, tenant, limit, after)` | keys issued at a tenant; **never `key_hash`** |
+| `log_audit(actor, tenant, action, target_type, target_id, before, after, outcome, reason, ctx)` | the only writer of `audit_logs`. Called by all 13 writes in their own transaction, and by the caller for a refusal |
+| `list_audit_logs(actor, tenant, actor_filter, action, target_type, target_id, request_id, outcome, from, to, limit, after)` | the trail, newest first, filtered to what the actor may read |
+| `prune_audit_logs(before, tenant, limit)` | deletes one batch of rows older than a cutoff. **No actor, no scope** — a maintenance job, single-flighted by an advisory lock |
 
 **Mutating functions take the actor explicitly rather than reading the JWT.** An adapter holds a direct `postgres` connection with no `request.jwt.claims` set, so `auth.uid()` is null there, and API-key principals never carry a JWT at all — both resolve the caller themselves and pass it in. `current_principal_id()` is for a JWT-bound wrapper overload, which is the only form that should ever be granted to `authenticated`; the explicit-actor form must not be, or any caller could impersonate any principal.
 
@@ -207,7 +210,7 @@ The parent anchor also makes a cut **self-healing**. An administrator who cuts o
 
 `principal_is_active` asks a **different** question from the filter inside `effective_bindings`, which is why they are not shared. That one asks what a principal *would* hold and admits unclaimed identities on purpose, so an admin view can see grants waiting for someone who has not signed up. This one asks whether somebody is actually behind the principal, so an unclaimed identity fails — nobody can have authenticated as one.
 
-These guards live in the functions, not in constraints, so they bind callers going through the sanctioned API — which under posture A is every caller, since only the server can reach the schema at all. Note also that no table has an `updated_at` trigger; functions that amend rows set it explicitly, and a direct `UPDATE` that forgets to will leave it stale.
+These guards live in the functions, not in constraints, so they bind callers going through the sanctioned API — which under posture A is every caller, since only the server can reach the schema at all. Note also that no table has an `updated_at` trigger; functions that amend rows set it explicitly, and a direct `UPDATE` that forgets to will leave it stale. `audit_logs` is the exception that proves it — nothing amends an audit row, so it carries no `updated_at` at all.
 
 The read helpers are `stable` and `security definer` — the owner bypasses RLS, so these are the only sanctioned read path — with one deliberate exception, below.
 
@@ -222,12 +225,71 @@ The read helpers are `stable` and `security definer` — the owner bypasses RLS,
 - **Your own bindings are always visible**, as in the `role_bindings` policy, and **membership reveals names**: your own binding shows its tenant's and role's names without `tenants.read`/`roles.read`, because a tenant switcher that cannot name your tenants is useless.
 - **Member details are gated where the binding was made.** `list_tenant_bindings` shows email with `users.read` at the binding's own tenant. That is narrower than `can_read_user`, which also admits someone readable through another tenant, and it is deliberate: `can_read_user` is a query per row, and ordering by email would force it onto every member of the tenant, not just one page.
 - **Inherited bindings are opt-in** (`include_inherited`), because under the master they include the platform operators. Each is still shown only with `bindings.read` where it was made, so a tenant admin sees none from above.
-- **Lists page by keyset.** PostgREST truncates RPC results at `max_rows` (1000) silently, so nothing returns an unbounded set. `page_cursor` is the row's id followed by its sort key — ids are fixed-width, so no delimiter is needed. `p_limit` is clamped to [1, 1000].
+- **Lists page by keyset.** PostgREST truncates RPC results at `max_rows` (1000) silently, so nothing returns an unbounded set. `page_cursor` is the row's id followed by its sort key — ids are fixed-width, so no delimiter is needed. `p_limit` is clamped to [1, 1000]. `list_audit_logs` is the one descending list, newest first, so its cursor comparison is `<` rather than `>`.
+- **The audit trail is a read like any other**, `list_audit_logs`, and is covered by the same policy-parity test. See [Audit log](#audit-log).
 
 Two performance rules the reads depend on, both measured on 20k members:
 
 - `list_tenant_bindings` computes authority once per tenant in the chain, in a CTE marked **`MATERIALIZED`**. Without it Postgres inlines the CTE and runs the `has_scope` calls per member row: 43 seconds per page, against ~125 ms.
 - `list_child_tenants` answers every *inheriting* child with one check at the parent. That is sound because an inheriting child receives every binding in force at its parent, so authority there implies authority at the child; only `inherit = false` children need their own check. It keeps listing the master's workspaces cheap for an operator. For a caller *without* authority at the parent it still checks every child, so it is not a way to find your own tenants — `list_principal_bindings` is.
+
+## Audit log
+
+`audit_logs` had a table, five indexes, a SELECT policy and an `authz.audit.read` scope before it had a single writer or reader. It now has exactly one of each: **`log_audit` writes, `list_audit_logs` reads**, and nothing else touches the table.
+
+**Successful writes log themselves, inside their own transaction.** All 13 mutating functions call `log_audit` before returning, so the row and the change it describes commit or roll back together — an integration test rolls a `create_role` back and asserts its audit row goes with it. A row written from the caller over a second round trip could not promise that: a process that dies between the two leaves a change with no record, or a record of a change that never landed.
+
+**A refusal cannot be logged the same way, and that is the one structural constraint here.** Every guard signals with `raise exception`, which rolls back the transaction *and any audit row written inside it*, and Postgres has no autonomous transaction to escape that. Denied rows are therefore written afterwards, from the caller — `packages/core` catches `AuthzDeniedError` in the write API and the 403 branches of `enforceGuard` — through the same `log_audit` with `outcome => 'denied'`. This is why `log_audit` is callable at all rather than being a private helper.
+
+**Nothing in `log_audit` may raise.** It runs inside the transaction of the write it describes, so a failure there fails that write: a grant lost to a malformed audit row would be the logging making the system less correct. Both foreign keys are resolved rather than trusted and fall back to null; `action` and `target_type` coalesce; `outcome` is narrowed to the two legal values rather than passed through to the check constraint. Resolving rather than trusting matters most for denials, which are recorded for exactly the input that caused them — often a tenant id the caller invented — where a foreign key violation would turn a clean 403 into a 500.
+
+**There is still no `authz.audit.write` scope**, which is the seed comment's rule (`20260907060000_auth_kit_bootstrap.sql`) kept rather than overturned. Nothing writes audit rows by virtue of holding a role. Under posture A only the server reaches `authz` at all, and whoever holds that connection is already trusted to name any actor, so the write path needs no scope of its own — and forging is prevented by the caller binding the actor, not by a permission.
+
+**Request context travels as one jsonb**, `p_request_ctx`, on every mutating function. Three things ruled out the alternatives:
+
+- A session GUC (`set_config('authz.request_id', …)`) cannot work: the supabase-js transport cannot set one in the same transaction as the RPC it wraps, and the two transports must stay indistinguishable.
+- Five scalar parameters would be five signature changes across 13 functions the next time a field is added. One jsonb is one.
+- Adding *any* parameter is a `drop function` + create, because overloading is forbidden — PostgREST cannot disambiguate. That drops the function's grants too. See the note in `../CLAUDE.md`.
+
+Recognised keys are `request_id`, `method`, `route`, `ip`, `user_agent`; anything else is ignored.
+
+**Visibility is the policy, exactly.** `list_audit_logs` gates each row on `authz.audit.read` at the row's own tenant, and a tenantless row — a platform-level action — at the master, which is the `coalesce` the `audit_logs` policy already spelled out. Because `has_scope` resolves through the ancestor chain, authority at a tenant covers its descendants' rows: an operator at the master sees everything, a tenant admin sees their own subtree. `audit.integration.test.ts` holds the function and the policy equal on the same row set, as the other reads do.
+
+Two consequences worth stating:
+
+- **`p_tenant_id` narrows rather than widens.** Leaving it null is "every row you may see", which is how a subtree is read; naming a tenant filters to that tenant alone. It is also the cost knob: the readable set is computed once per tenant in a `MATERIALIZED` CTE, for the same reason `list_tenant_bindings` does it, and a tenant filter collapses that CTE to a single check.
+- **Some denials land as platform-level rows.** A refused `revoke_binding` or `update_role` is anchored on a tenant that only the row being changed knows, which TypeScript would have to query for — a second chance to fail on the denial path. Those rows carry no tenant and so are readable at the master, deliberately not by the tenant admin whose call was refused.
+
+### Pruning
+
+`prune_audit_logs(before, tenant, limit)` deletes one batch of rows older than a cutoff. It is the second hard delete in the schema, after `role_scopes`, and the only one that destroys history.
+
+**It takes no actor and checks no scope**, which is the one place the "mutating functions take an explicit actor" rule does not hold, and deliberately so. Retention is a maintenance job: a cron worker has no principal to name; the model has no system principal to invent, since `principals_exactly_one_of` forbids one; and passing null would simply fail every check, because `has_scope(null, …)` is false. Naming some real principal instead would put a lie in the audit row. So authority here is holding the server's credentials — the same basis `provision_admin` and `reclaim_identity` already rest on.
+
+That also settles what would otherwise have been a new built-in scope. `authz.audit.prune` was considered and rejected: `admin` takes every `authz.%` scope by a `select`, and `tenant_admin` takes the same set minus `authz.users.write`, so a new scope would land in every workspace owner's hands unless explicitly excluded — and a tenant admin who can prune can erase the record of their own actions. No scope means no seeding change and no delegation path, which is the safe default. Adding one later is possible; removing one that shipped is not.
+
+**It is granted to `service_role`**, unlike the other two actor-less functions, because a supabase-js deployment reaches `authz` no other way and would otherwise have no retention at all. This grants nothing new: a secret key can already call `grant_role` naming any actor, so it is already total authority over this schema. It must never reach `anon` or `authenticated`, where it would be an erase-your-own-trail primitive for any caller.
+
+**Two mechanisms make it safe to run on every replica**, and they cover different failures:
+
+- A **transaction-scoped advisory lock**, keyed on the tenant filter, single-flights the prune so replicas do not duplicate each other's scans. Transaction-scoped means it is released on commit and cannot leak if a pod dies holding it, and since one call is one transaction, a loop of batches releases and retakes it between batches rather than one replica starving the others. Keying on the filter keeps a per-tenant prune from serialising against a global one.
+- **`FOR UPDATE SKIP LOCKED`** on the batch selection covers what the lock does not: a prune run by hand from the SQL editor, or the per-tenant and global cases overlapping on the same rows. Each caller takes a disjoint batch instead of blocking on the other's row locks.
+
+The return value is `(deleted_count, lock_acquired)` rather than a bare count, because **zero deleted is ambiguous**: it means both "nothing left" and "someone else is already doing it", and a `while (deleted > 0)` loop must stop for the first and come back for the second.
+
+Three smaller rules, each of which has a test:
+
+- **A prune never deletes its own records.** Rows with `action = 'prune_audit_logs'` are exempt, so the record of what was destroyed outlives the destruction — otherwise a trail with a hole in it is indistinguishable from one that never had those rows. One row per prune that deleted something, so the exemption stays small.
+- **A prune that deleted nothing logs nothing.** A job running every five minutes on three replicas would otherwise write more rows than it removes.
+- **The cutoff has no default.** A forgotten argument must not mean "everything".
+
+No new index is needed: the global case walks `audit_log_created_at_idx`, and the tenant case `audit_log_tenant_idx (tenant_id, created_at)`.
+
+### What this does not solve
+
+- ~~**Retention.**~~ **Settled** — see [Pruning](#pruning) below. No policy is shipped: the kit provides the primitive, and how often and how far back to prune is the consumer's.
+- **Immutability.** RLS denies `UPDATE` and `DELETE` to everyone — except the role the kit actually connects as, which bypasses RLS. Nothing in the database stops the owner rewriting history. A `BEFORE UPDATE OR DELETE` trigger that raises is the only construct that binds an owner; dropping `updated_at` states the intent but does not enforce it.
+- **PII.** `invite_user` records the address, because there the action *is* the address. That outlives the account by design — deleting the `auth.users` row unlinks the identity and leaves the trail intact — so an erasure request reaches this table and is not satisfied by deleting the Supabase user. Refused invites deliberately omit the address: the refusal may be the retired-identity probe that `invite_user` orders its checks to prevent, and writing it into a readable table would hand back what that ordering protects.
 
 ## Open questions
 

@@ -146,6 +146,7 @@ const next = await me.listTenantBindings(tenantId, { limit: 50, after: nextCurso
 | `listRoleScopes(tenantId, roleId, page?)` | The scopes a role confers, including an inherited role such as `tenant_admin` | `authz.roles.read` |
 | `listScopes(tenantId, page?)` | Scope definitions in effect after shadowing | `authz.scopes.read` |
 | `listApiKeys(tenantId, page?)` | Keys issued at the tenant, revoked ones included. Never the key hash | `authz.api_keys.read` |
+| `listAuditLogs(filter?)` | The audit trail, newest first. See [Audit log](#audit-log) | `authz.audit.read` |
 
 Lists return `{ rows, nextCursor }`. Pass `nextCursor` back as `after` to get the next page; it's `null` once a page comes back short. `limit` defaults to 100 and is capped at 1000. Treat cursors as opaque: a malformed one throws `AuthzUsageError`.
 
@@ -176,6 +177,61 @@ await writes.inviteUser(tenantId, "new.hire@example.com", roleId);
 | `updateTenant(tenantId, { name?, inherit? })` | Changing `inherit` needs authority at the parent |
 | `createApiKey(tenantId, label, expiresAt?)` | Returns the plaintext key. It's shown only this once |
 | `revokeApiKey(apiKeyId)` | Idempotent |
+| `logAudit(entry)` | Appends an audit row. Never throws: resolves to the row ID, or `null` if the write failed |
+
+## Audit log
+
+Every write above records itself, in the same transaction as the change, so the log can't disagree with what actually happened. You don't have to call anything.
+
+What the database can't see is the request, so pass it when you bind the actor — the framework adapters do this for you:
+
+```ts
+const writes = kit.as(actorPrincipalId, {
+    requestId: req.id,
+    method: req.method,
+    route: "/tenants/:id/members",
+    ip: req.ip,
+    userAgent: req.headers["user-agent"],
+});
+```
+
+**Refusals are recorded too.** A write the SQL guards refuse, and a request a scope guard turns away, both leave a row with `outcome: "denied"` and the refusal's message in `reason`. This can't happen inside the database — the refusal rolls its own transaction back, audit row included — so the kit writes it afterwards and rethrows the original error unchanged. Turn it off with `audit: { denials: false }` when a public endpoint behind a guard would write a row per probe.
+
+Audit writes never reject, so a logging failure can't break a request or mask a denial. Pass `audit: { onError }` to find out when one fails.
+
+```ts
+const { rows } = await kit.as(principalId).listAuditLogs({
+    tenantId,                       // omit for every row you may see, including descendants
+    outcome: "denied",
+    from: new Date(Date.now() - 86_400_000),
+    limit: 100,
+});
+```
+
+Filters — all optional — are `tenantId`, `actorPrincipalId`, `action`, `targetType`, `targetId`, `requestId`, `outcome`, `from` (inclusive) and `to` (exclusive), plus the usual `limit` and `after`. Rows carry `before` and `after` as JSON, and reading them needs `authz.audit.read` at the tenant; a row with no tenant is a platform-level action and needs that scope at the master tenant.
+
+### Retention
+
+Nothing prunes the log for you, and it grows with every write and every refusal. `kit.pruneAuditLogs` deletes one batch of rows older than a cutoff:
+
+```ts
+const cutoff = new Date(Date.now() - 90 * 86_400_000);
+
+for (;;) {
+    const { deleted_count, lock_acquired } = await kit.pruneAuditLogs({ before: cutoff });
+
+    if (!lock_acquired) break;      // another replica is already pruning
+    if (deleted_count === 0) break; // nothing left older than the cutoff
+
+    await new Promise(r => setTimeout(r, 100));
+}
+```
+
+It's on `kit`, not on `kit.as(actor)`, because no principal does this — a cron job has none to name. Authority is the database connection, the same basis the other operator tools rest on, so anything that can reach the kit can prune. There's no scope for it and no way to delegate it to a tenant.
+
+**Safe to run on every replica.** An advisory lock means only one prunes at a time, and `lock_acquired: false` tells a replica that didn't get it to stop — which is why the return value isn't just a count, since zero deleted otherwise means both "finished" and "someone else is doing it". Pass `limit` to size the batch (1000 by default) and `tenantId` to prune one tenant's rows, for instance when offboarding.
+
+Two things it won't do: delete its own prune records, so you keep a permanent account of what was removed and when, and write a row when it deleted nothing, so an idle job doesn't fill the table it's meant to drain. `before` is required — a forgotten argument must never mean everything.
 
 ### Errors
 

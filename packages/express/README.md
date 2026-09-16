@@ -156,7 +156,7 @@ Letting the client choose the tenant is safe: a tenant where the caller holds no
 const { rows, nextCursor } = await getAuthContext(req).as!.listTenantBindings(tenantId, { limit: 50 });
 ```
 
-`getTenant`, `listChildTenants`, `listMyBindings`, `listPrincipalBindings`, `listTenantBindings`, `listRoles`, `listRoleScopes`, `listScopes` and `listApiKeys` are covered in the [core package's README](https://www.npmjs.com/package/@sirhc77/supabase-auth-kit-core#reads), with the scope each one needs and how paging works.
+`getTenant`, `listChildTenants`, `listMyBindings`, `listPrincipalBindings`, `listTenantBindings`, `listRoles`, `listRoleScopes`, `listScopes`, `listApiKeys` and `listAuditLogs` are covered in the [core package's README](https://www.npmjs.com/package/@sirhc77/supabase-auth-kit-core#reads), with the scope each one needs and how paging works.
 
 ### Writes
 
@@ -194,9 +194,30 @@ app.post(
 | `updateTenant(tenantId, { name?, inherit? })` | |
 | `createApiKey(tenantId, label, expiresAt?)` | Returns the plaintext key. It's shown only this once |
 | `revokeApiKey(apiKeyId)` | |
+| `logAudit(entry)` | Appends an audit row of your own. Never throws |
 
 A refused write throws `AuthzDeniedError`. The message doesn't say why, so it can't reveal whether a role or tenant exists. `AuthzStateError` usually means the kit's migrations haven't been applied, and `AuthzConfigError` means the connection can't reach `authz` at all: the wrong key, or the schema isn't exposed.
 
+
+### Audit log
+
+Every write records itself, and so does every refusal — a request your guards turn away leaves a row saying who asked for what and why it was refused. Nothing needs calling.
+
+The adapter fills in the request for you: the method, the URL, the caller's IP, the user agent, and a request ID from `x-request-id` or a generated one. Two caveats worth knowing on Express:
+
+- **The route is the URL, not the pattern.** `req.route` isn't populated until Express has matched a route, and `authenticate()` runs before that, so you'll see `/t/9f3.../members` rather than `/t/:tenantId/members`.
+- **The request ID is generated** unless the caller sent `x-request-id`. It still ties one request's rows together; to tie them to your own logs, use the same ID in both.
+
+Supply your own if you'd rather — returning `null` records the rows without any request metadata:
+
+```ts
+const auth = createExpressAuthKit({
+    // ...
+    requestContext: req => ({ requestId: req.id, method: req.method, route: req.route?.path }),
+});
+```
+
+Read the trail with `listAuditLogs`, prune it with `auth.kit.pruneAuditLogs` from a scheduled job, and turn refusal logging off with `audit: { denials: false }` if a public endpoint behind a guard would write a row per probe. All three are documented in the [core package's README](https://www.npmjs.com/package/@sirhc77/supabase-auth-kit-core#audit-log).
 For work outside a request, such as jobs or scripts, `auth.kit` exposes the underlying core API: `hasScope`, `effectiveScopes`, `principalForAuthUser`, `as(principalId)`, and so on.
 
 ## Errors

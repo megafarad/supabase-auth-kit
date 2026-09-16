@@ -23,7 +23,9 @@ interface Stub {
 }
 
 function build(app: Express, stub: Stub) {
-    const query = vi.fn(async (sql: string) => {
+    const audited: unknown[][] = [];
+
+    const query = vi.fn(async (sql: string, params: readonly unknown[]) => {
         if (sql.includes("principal_for_auth_user")) {
             return [{ result: stub.principal ?? null }];
         }
@@ -34,6 +36,12 @@ function build(app: Express, stub: Stub) {
 
         if (sql.includes("effective_scopes")) {
             return (stub.scopes ?? []).map(s => ({ scope_name: s }));
+        }
+
+        if (sql.includes("log_audit")) {
+            audited.push([...params]);
+
+            return [{ result: "audit-row" }];
         }
 
         throw new Error(`unexpected sql: ${sql}`);
@@ -49,7 +57,7 @@ function build(app: Express, stub: Stub) {
         res.json({ ok: true });
     });
 
-    return { auth, query, handler, app };
+    return { auth, query, handler, app, audited };
 }
 
 for (const [label, factory] of [
@@ -277,6 +285,93 @@ for (const [label, factory] of [
         });
     });
 }
+
+describe("audit context on Express", () => {
+    let app: Express;
+
+    beforeEach(() => {
+        app = express5();
+    });
+
+    it("records a refused request with the context Express can give", async () => {
+        const { auth, handler, audited } = build(app, {
+            principal: PRINCIPAL,
+            scopes: [],
+        });
+
+        app.use(auth.authenticate());
+        app.post("/t/:tenantId/x", auth.requireScope("authz.roles.read"), handler as never);
+
+        await request(app)
+            .post(`/t/${TENANT}/x`)
+            .set("authorization", "Bearer tok")
+            .set("x-request-id", "req-42")
+            .set("user-agent", "vitest");
+
+        expect(handler).not.toHaveBeenCalled();
+        expect(audited).toHaveLength(1);
+
+        const context = audited[0]?.at(-1) as Record<string, string>;
+
+        expect(context).toMatchObject({
+            request_id: "req-42",
+            method: "POST",
+            user_agent: "vitest",
+            // The URL, not the pattern: req.route is not populated until Express has matched a
+            // route, and authenticate() runs before that.
+            route: `/t/${TENANT}/x`,
+        });
+    });
+
+    it("mints a request id when nothing carries one", async () => {
+        const { auth, audited } = build(app, { principal: PRINCIPAL, scopes: [] });
+
+        app.use(auth.authenticate());
+        app.get("/t/:tenantId/x", auth.requireScope("authz.roles.read"), (() => {}) as never);
+
+        await request(app).get(`/t/${TENANT}/x`).set("authorization", "Bearer tok");
+
+        const context = audited[0]?.at(-1) as Record<string, string>;
+
+        // Still correlates this request's rows with each other, which is most of the value.
+        expect(context["request_id"]).toMatch(/^[0-9a-f-]{36}$/);
+    });
+
+    it("honours a caller-supplied request context, including none at all", async () => {
+        const audited: unknown[][] = [];
+
+        const query = vi.fn(async (sql: string, params: readonly unknown[]) => {
+            if (sql.includes("principal_for_auth_user")) return [{ result: PRINCIPAL }];
+            if (sql.includes("effective_scopes")) return [];
+
+            if (sql.includes("log_audit")) {
+                audited.push([...params]);
+
+                return [{ result: "audit-row" }];
+            }
+
+            throw new Error(`unexpected sql: ${sql}`);
+        });
+
+        const auth = createExpressAuthKit({
+            query,
+            verifyBearer: async () => AUTH_USER,
+            resolveTenant: tenantFromParam("tenantId"),
+            // An app that does not want request metadata in its audit rows -- a jurisdiction
+            // where the IP is personal data, say -- opts out here rather than losing the row.
+            requestContext: () => null,
+        });
+
+        app.use(auth.authenticate());
+        app.get("/t/:tenantId/x", auth.requireScope("authz.roles.read"), (() => {}) as never);
+
+        await request(app).get(`/t/${TENANT}/x`).set("authorization", "Bearer tok");
+
+        // The denial is still recorded; it just says nothing about the request.
+        expect(audited).toHaveLength(1);
+        expect(audited[0]?.at(-1)).toBeNull();
+    });
+});
 
 describe("async wrapper shape", () => {
     // The assertion that actually pins Express 4 compatibility: the handler must be sync-outer,

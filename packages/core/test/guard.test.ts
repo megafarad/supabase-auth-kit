@@ -18,18 +18,44 @@ import type { Row } from "../src/query.js";
 const TENANT = "22222222-2222-4222-8222-222222222222";
 const PRINCIPAL = "11111111-1111-4111-8111-111111111111";
 
-function contextWith(resolved: ResolvedPrincipal, scopes: string[] = []) {
-    const query = vi.fn(async (sql: string): Promise<Row[]> => {
+function contextWith(
+    resolved: ResolvedPrincipal,
+    scopes: string[] = [],
+    options: { audit?: { denials?: boolean } } = {},
+) {
+    // Denial logging writes through the same query hook, so scope lookups are counted on their
+    // own: "one round trip" has always meant one effective_scopes call, and an audit row is not
+    // one of those.
+    const audited: unknown[][] = [];
+    const scopeQueries = vi.fn();
+
+    const query = vi.fn(async (sql: string, params: readonly unknown[]): Promise<Row[]> => {
         if (sql.includes("effective_scopes")) {
+            scopeQueries();
+
             return scopes.map(s => ({ scope_name: s }));
+        }
+
+        if (sql.includes("log_audit")) {
+            audited.push([...params]);
+
+            return [{ result: "audit-row" }];
         }
 
         throw new Error(`unexpected sql: ${sql}`);
     });
 
-    const kit = createAuthKit({ query, verifyBearer: async () => null });
+    const kit = createAuthKit({
+        query,
+        verifyBearer: async () => null,
+        ...(options.audit === undefined ? {} : { audit: options.audit }),
+    });
 
-    return { context: createAuthzContext(kit, resolved), query };
+    return {
+        context: createAuthzContext(kit, resolved, { requestId: "req-1", method: "GET" }),
+        query: scopeQueries,
+        audited,
+    };
 }
 
 const anonymous: ResolvedPrincipal = {
@@ -105,6 +131,77 @@ describe("enforceGuard", () => {
 
         expect(error).toBeInstanceOf(ForbiddenError);
         expect((error as ForbiddenError).scope).toBe("x");
+    });
+});
+
+describe("denial logging", () => {
+    it("records a denied row when a scope is missing", async () => {
+        const { context, audited } = contextWith(user, ["y"]);
+
+        await enforceGuard(context, () => TENANT, checkScope("x")).catch(() => {});
+
+        expect(audited).toHaveLength(1);
+        // The actor, the tenant it was asked about, and the refusal's own words.
+        expect(audited[0]).toEqual(
+            expect.arrayContaining([PRINCIPAL, TENANT, "authorize", "missing scope x"]),
+        );
+    });
+
+    it("records a credential that maps to no identity, with no tenant", async () => {
+        const { context, audited } = contextWith(unresolved);
+
+        await enforceGuard(context, () => TENANT, checkScope("x")).catch(() => {});
+
+        // The guard refuses before resolving a tenant, so there is none to anchor to: a
+        // platform-level row, readable with authz.audit.read at the master.
+        expect(audited).toHaveLength(1);
+        expect(audited[0]).toEqual(expect.arrayContaining(["authenticate", "request"]));
+        expect(audited[0]).not.toContain(TENANT);
+    });
+
+    it("records nothing for a request that presented no credential", async () => {
+        const { context, audited } = contextWith(anonymous);
+
+        await enforceGuard(context, () => TENANT, checkScope("x")).catch(() => {});
+
+        // Nobody was refused anything -- the request did not say who it was. Logging 401s
+        // would turn every unauthenticated probe into a write.
+        expect(audited).toHaveLength(0);
+    });
+
+    it("records nothing for an unresolvable tenant", async () => {
+        const { context, audited } = contextWith(user, ["x"]);
+
+        await enforceGuard(context, () => "not-a-uuid", checkScope("x")).catch(() => {});
+
+        // A malformed request, not a refusal.
+        expect(audited).toHaveLength(0);
+    });
+
+    it("is off when audit.denials is false", async () => {
+        const { context, audited } = contextWith(user, ["y"], {
+            audit: { denials: false },
+        });
+
+        await enforceGuard(context, () => TENANT, checkScope("x")).catch(() => {});
+
+        expect(audited).toHaveLength(0);
+    });
+
+    it("still denies when the audit row cannot be written", async () => {
+        const query = vi.fn(async (sql: string): Promise<Row[]> => {
+            if (sql.includes("effective_scopes")) return [];
+
+            throw new Error("audit insert failed");
+        });
+
+        const kit = createAuthKit({ query, verifyBearer: async () => null });
+        const context = createAuthzContext(kit, user);
+
+        // The guard's answer must not depend on whether the log accepted the row.
+        await expect(
+            enforceGuard(context, () => TENANT, checkScope("x")),
+        ).rejects.toBeInstanceOf(ForbiddenError);
     });
 });
 
