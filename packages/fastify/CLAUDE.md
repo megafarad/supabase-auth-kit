@@ -39,6 +39,8 @@ It decorates `request.authKit` with `null` (Fastify 5 accepts only `null` or a g
 
 No `wrapAsync` equivalent is needed: Fastify awaits async hooks and routes a rejection to the error handler.
 
+`requireIdentity()` runs core's `enforceIdentity` — the guard's first two branches only, so 500 / 401 / 403 and then through, with no tenant, no scope and no round trip. It is for the routes whose authority the request cannot name: `createWorkspace` requires no scope at any tenant, and the writes anchored on a row's own tenant (`revokeBinding`, `updateRole`, `addRoleScope`, `removeRoleScope`, `revokeApiKey`) are governed by a tenant only SQL can read. On a tenant-less route such as `POST /workspaces`, `requireScope` answers **400 to every request** — there is a test asserting exactly that next to the `requireIdentity` ones — so this is the only guard those routes can carry, not a cheaper one for the routes that can carry both. **Never on a read**: reads refuse by filtering, so it would answer `200 []` where `requireScope` answers 403.
+
 **Which stage.** `onRequest` is the default recommendation — it rejects before the body is parsed. Use `preValidation` or `preHandler` only when the tenant comes from the body (`tenantFromBody`). At `onRequest` there is no body yet, so `tenantFromBody` yields nothing and the guard answers 400: early is a fail-closed mistake, never an allow.
 
 ## Errors

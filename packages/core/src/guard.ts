@@ -10,12 +10,60 @@ import { isUuid } from "./uuid.js";
 export type GuardCheck = (context: AuthzContext, tenantId: string) => Promise<void>;
 
 /**
+ * Branches 1 and 2 of the guard on their own: **is there somebody behind this request at all?**
+ * No tenant, no scope, and no database round trip -- it reads only what `resolvePrincipal`
+ * already settled.
+ *
+ *   1. no principal, no credential presented  -> 401
+ *   2. no principal, credential presented     -> 403 (open question 1: authenticated, zero authority)
+ *
+ * `enforceGuard` runs this first, and a binding exposes it alone as `requireIdentity()` for the
+ * routes where **the kit's own SQL anchors authority on something the request does not name**:
+ * `create_workspace` requires no scope at any tenant (only `principal_is_active`), and the
+ * writes anchored on a row's own tenant -- `revoke_binding`, `update_role`, `add_role_scope`,
+ * `remove_role_scope`, `revoke_api_key` -- are governed by a tenant only the row knows. A
+ * `checkScope` against whatever tenant the URL happens to carry would be checking the wrong
+ * tenant there, which is worse than not checking: it reads like enforcement and is not.
+ *
+ * What it still buys in front of those: 401 and 403 stay distinguishable, the handler never runs
+ * for a request with nobody behind it, and `context.as` is non-null by the time it does.
+ *
+ * **Never use it in place of a scope check on a read.** Reads refuse by filtering -- an actor
+ * without the authority gets an empty page, not an error -- so this alone would answer `200 []`
+ * where `requireScope` answers 403.
+ */
+export async function enforceIdentity(context: AuthzContext): Promise<void> {
+    if (context.principalId !== null) {
+        return;
+    }
+
+    if (!context.credentialPresented) {
+        throw new UnauthenticatedError();
+    }
+
+    const denial = new ForbiddenError(
+        "credential verified but maps to no authz identity",
+    );
+
+    // No tenant: this refuses before one is resolved -- and `requireIdentity` has none to
+    // resolve at all -- so there is nothing to anchor the row to. It is a platform-level row,
+    // readable with authz.audit.read at the master.
+    await context.recordDenial({
+        action: "authenticate",
+        targetType: "request",
+        reason: denial.message,
+    });
+
+    throw denial;
+}
+
+/**
  * The guard every framework binding runs. **The order here is the whole guard**, and it lives in
  * one place so the bindings cannot drift apart. Every branch either denies or continues; none
  * skips:
  *
- *   1. no principal, no credential presented  -> 401
- *   2. no principal, credential presented     -> 403 (open question 1: authenticated, zero authority)
+ *   1. no principal, no credential presented  -> 401  \ enforceIdentity, above, which a binding
+ *   2. no principal, credential presented     -> 403  / also exposes on its own
  *   3. tenant unresolvable or not a uuid      -> 400
  *   4. the check                              -> 403 on a missing scope
  *
@@ -35,25 +83,7 @@ export async function enforceGuard(
     resolveTenant: () => unknown,
     check: GuardCheck,
 ): Promise<void> {
-    if (context.principalId === null) {
-        if (!context.credentialPresented) {
-            throw new UnauthenticatedError();
-        }
-
-        const denial = new ForbiddenError(
-            "credential verified but maps to no authz identity",
-        );
-
-        // No tenant: the guard refuses here before resolving one, so there is nothing to anchor
-        // the row to. It is a platform-level row, readable with authz.audit.read at the master.
-        await context.recordDenial({
-            action: "authenticate",
-            targetType: "request",
-            reason: denial.message,
-        });
-
-        throw denial;
-    }
+    await enforceIdentity(context);
 
     const tenantId = await resolveTenant();
 

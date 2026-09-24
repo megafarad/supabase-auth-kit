@@ -86,6 +86,7 @@ export {
     checkAnyScope,
     checkScope,
     enforceGuard,
+    enforceIdentity,
     type GuardCheck,
 } from "./guard.js";
 export { credentialsFromHeaders, type HeaderBag } from "./headers.js";

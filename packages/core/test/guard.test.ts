@@ -11,6 +11,7 @@ import {
     createAuthzContext,
     credentialsFromHeaders,
     enforceGuard,
+    enforceIdentity,
     type ResolvedPrincipal,
 } from "../src/index.js";
 import type { Row } from "../src/query.js";
@@ -131,6 +132,52 @@ describe("enforceGuard", () => {
 
         expect(error).toBeInstanceOf(ForbiddenError);
         expect((error as ForbiddenError).scope).toBe("x");
+    });
+});
+
+describe("enforceIdentity", () => {
+    it("allows a resolved principal without asking what it may do", async () => {
+        const { context, query } = contextWith(user);
+
+        await expect(enforceIdentity(context)).resolves.toBeUndefined();
+        // The whole point of the branch: no tenant, no scope, no round trip.
+        expect(query).not.toHaveBeenCalled();
+    });
+
+    it("rejects no credential as unauthenticated, recording nothing", async () => {
+        const { context, audited } = contextWith(anonymous);
+
+        await expect(enforceIdentity(context)).rejects.toBeInstanceOf(UnauthenticatedError);
+        expect(audited).toHaveLength(0);
+    });
+
+    // Open question 1, reached without a tenant to resolve: still a 403, never a 500.
+    it("rejects a presented-but-unresolved credential as forbidden", async () => {
+        const { context, audited } = contextWith(unresolved);
+
+        await expect(enforceIdentity(context)).rejects.toBeInstanceOf(ForbiddenError);
+
+        // A platform-level row, as from enforceGuard's own second branch.
+        expect(audited).toHaveLength(1);
+        expect(audited[0]).toEqual(expect.arrayContaining(["authenticate", "request"]));
+        expect(audited[0]).not.toContain(TENANT);
+    });
+
+    it("gives the same answers enforceGuard's first two branches give", async () => {
+        // Pinned against each other so the shared branch cannot drift once both are exported.
+        for (const resolved of [anonymous, unresolved]) {
+            const viaGuard = await enforceGuard(
+                contextWith(resolved).context,
+                () => TENANT,
+                checkScope("x"),
+            ).catch((e: unknown) => e);
+            const viaIdentity = await enforceIdentity(contextWith(resolved).context).catch(
+                (e: unknown) => e,
+            );
+
+            expect((viaIdentity as Error).constructor).toBe((viaGuard as Error).constructor);
+            expect((viaIdentity as Error).message).toBe((viaGuard as Error).message);
+        }
     });
 });
 

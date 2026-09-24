@@ -75,13 +75,17 @@ Everything a binding needs that is not framework-shaped lives here, so the secur
 
 | Module | Provides |
 | --- | --- |
-| `guard.ts` | `enforceGuard(context, resolveTenant, check)` — **the** decision order (401 / 403 / 400 / check), and the `checkScope` / `checkAllScopes` / `checkAnyScope` builders |
+| `guard.ts` | `enforceGuard(context, resolveTenant, check)` — **the** decision order (401 / 403 / 400 / check), `enforceIdentity(context)` — its first two branches alone, and the `checkScope` / `checkAllScopes` / `checkAnyScope` builders |
 | `context.ts` | `AuthzContext` and `createAuthzContext(kit, resolved)` — the per-request scope memo (promises, not values, so concurrent checks coalesce) and the pre-bound `as` |
 | `http-errors.ts` | `HttpAuthzError` and subclasses, `statusOf`. `status` is what both Express's `finalhandler` and Fastify's default handler read |
 | `headers.ts` | `credentialsFromHeaders(headers, apiKeyHeader)` — Bearer only, and an array-valued API-key header is no key |
 | `tenant.ts` | `tenantFromParam/Header/Query/Body` over a structural `TenantSource`, and the generic `TenantResolver<R>` each binding narrows |
 
 A missing context is the one guard branch left to the binding, because the fix its error names (mount a middleware, register a plugin) is framework-specific — hence `MiddlewareNotInstalledError`'s message parameter. `test/guard.test.ts` pins the order here; each adapter's suite pins it again end to end.
+
+**`enforceIdentity` is branches 1 and 2 on their own** — somebody, without asking what they may do — and each adapter exposes it as `requireIdentity()`. It exists because some of the kit's own writes anchor authority on something the request cannot name: `create_workspace` requires no scope at any tenant (only `principal_is_active`), and `revoke_binding`, `update_role`, `add_role_scope`, `remove_role_scope` and `revoke_api_key` are governed by the tenant on the row being changed, which only SQL can read. A `checkScope` against whatever tenant the URL happens to carry checks the *wrong* tenant there, and on a route with no tenant at all — `POST /workspaces` — `enforceGuard` answers 400 to every request, legitimate ones included. What `requireIdentity` still buys in front of those: 401 and 403 stay apart, the handler never runs for a request with nobody behind it, and `context.as` is non-null by the time it does. Both adapters' suites assert the 400 that `requireScope` gives on such a route, so the reason it exists cannot be mistaken for a performance tweak.
+
+The branch is deliberately factored rather than copied: `enforceGuard` calls `enforceIdentity`, and a unit test asserts the two produce the same error class and message for both no-credential and unresolved-credential requests. **It is never a substitute for a scope check on a read** — reads refuse by filtering, so `requireIdentity` on a list route answers `200 []` where `requireScope` answers 403.
 
 ## Deliberate non-features
 
