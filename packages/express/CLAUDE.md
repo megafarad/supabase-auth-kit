@@ -45,6 +45,8 @@ A missing or bad credential yields a context with no principal and the request p
 
 The second 403 is open question 1 made concrete: a token that verified against the project's own JWKS but maps to no `authz.users` row — reachable by registering an address a retired identity still holds. It is a clean 403, **never a 500**, and there is a test on both Express versions asserting the downstream handler did not run.
 
+`requireIdentity()` is the first two rows of that table and nothing else — core's `enforceIdentity`, shared with Fastify. It is for the routes whose authority the request cannot name: `createWorkspace` needs no scope at any tenant, and the writes anchored on a row's own tenant (`revokeBinding`, `updateRole`, `addRoleScope`, `removeRoleScope`, `revokeApiKey`) are governed by a tenant only SQL can read. On a tenant-less route `requireScope` answers **400 for everyone** — asserted on both Express versions right beside the `requireIdentity` cases — so it is not an alternative to the scope guard but the only guard those routes can have. **Never on a read**: reads refuse by filtering, so it would answer `200 []` where `requireScope` answers 403.
+
 `getAuthContext(req)` throws rather than returning undefined, because the shape to make unwritable is `if (req.authKit && !(await req.authKit.has(t, s))) deny()` — which silently allows when the middleware is missing. Guards use the accessor, never optional chaining.
 
 `req.authKit` is named that, not `req.auth`, to avoid a hard compile error for consumers who also use express-jwt or express-oauth2-jwt-bearer — both merge `Request.auth`. The `declare global` block lives in `src/index.ts` rather than a side file, so it cannot be dropped by `.d.ts` import elision.

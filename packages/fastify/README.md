@@ -135,6 +135,37 @@ The third row covers someone who signed in with a valid Supabase token but has n
 
 Scope checks aren't cached across requests, so a revoked grant takes effect on the next request.
 
+### requireIdentity
+
+`auth.requireIdentity()` requires *somebody*, not a scope: the first three rows of that table, then through. No tenant, no scope, no database round trip.
+
+Use it where the kit's SQL anchors authority on something the request doesn't name — the scope guard can't ask the right question there, and on a route with no tenant it answers 400 to everyone:
+
+```ts
+// createWorkspace needs no scope at any tenant: it checks that you are a claimed, active
+// principal, creates the tenant under the master and grants you tenant_admin on it.
+app.post<{ Body: { name: string } }>(
+    "/workspaces",
+    { onRequest: auth.requireIdentity() },
+    async (request, reply) => {
+        const tenantId = await getAuthContext(request).as!.createWorkspace(request.body.name);
+
+        return reply.code(201).send({ tenantId });
+    },
+);
+```
+
+| Write | Authority lives at |
+| --- | --- |
+| `createWorkspace` | nowhere — any claimed, active principal may create one |
+| `revokeBinding` | the binding's own tenant |
+| `updateRole`, `addRoleScope`, `removeRoleScope` | the role's tenant |
+| `revokeApiKey` | the key's tenant |
+
+Since those routes are refused inside SQL, **install `auth.errorHandler`** so the refusal is a 403 rather than a 500.
+
+**Don't use it on reads.** Reads refuse by filtering, so a caller without the authority gets an empty page instead of an error: `requireIdentity` on a list route answers `200 []` where `requireScope` answers 403. It is also not a faster `requireScope` — on any route where a scope guard can ask the right question, use the scope guard.
+
 ## Tenant resolution
 
 Every check asks whether *this principal* holds *this scope* at *this tenant*. The tenant comes from the request:

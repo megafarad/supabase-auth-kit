@@ -444,6 +444,118 @@ describe("plugin", () => {
     });
 });
 
+/**
+ * The route these exist for: `create_workspace` requires no scope at any tenant, and a
+ * `POST /workspaces` request names none, so `requireScope` cannot guard it -- the last test here
+ * is the proof, and the reason the hook is not just a faster guard.
+ */
+describe("requireIdentity on Fastify", () => {
+    let app: FastifyInstance;
+
+    beforeEach(() => {
+        app = fastify();
+    });
+
+    afterEach(async () => {
+        await app.close();
+    });
+
+    it("allows any principal, without an effective_scopes round trip", async () => {
+        const { auth, handler, query } = build({ principal: PRINCIPAL, scopes: [] });
+
+        await app.register(auth.plugin);
+        app.post("/workspaces", { onRequest: auth.requireIdentity() }, handler);
+
+        const res = await app.inject({
+            method: "POST",
+            url: "/workspaces",
+            headers: { authorization: "Bearer tok" },
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(handler).toHaveBeenCalledOnce();
+        // Holding no scope at all is fine here: SQL decides, and it needs no tenant to do it.
+        expect(effectiveScopeCalls(query)).toHaveLength(0);
+    });
+
+    it("returns 401 when no credential was presented", async () => {
+        const { auth, handler, audited } = build({ principal: PRINCIPAL });
+
+        await app.register(auth.plugin);
+        app.post("/workspaces", { onRequest: auth.requireIdentity() }, handler);
+
+        const res = await app.inject({ method: "POST", url: "/workspaces" });
+
+        expect(res.statusCode).toBe(401);
+        expect(res.json().code).toBe("unauthenticated");
+        expect(handler).not.toHaveBeenCalled();
+        expect(audited).toHaveLength(0);
+    });
+
+    it("returns 403, not 500, for a verified token with no authz identity", async () => {
+        const { auth, handler, audited } = build({ principal: null, verify: AUTH_USER });
+
+        await app.register(auth.plugin);
+        app.post("/workspaces", { onRequest: auth.requireIdentity() }, handler);
+
+        const res = await app.inject({
+            method: "POST",
+            url: "/workspaces",
+            headers: { authorization: "Bearer tok" },
+        });
+
+        expect(res.statusCode).toBe(403);
+        expect(res.json().code).toBe("forbidden");
+        expect(handler).not.toHaveBeenCalled();
+        // Recorded with no tenant, exactly as enforceGuard's own second branch records it.
+        expect(audited).toHaveLength(1);
+        expect(audited[0]).toEqual(expect.arrayContaining(["authenticate", "request"]));
+    });
+
+    // A wiring bug must not be indistinguishable from an allow here either.
+    it("returns 500 when the plugin was never registered", async () => {
+        const { auth, handler } = build({ principal: PRINCIPAL });
+
+        app.post("/workspaces", { onRequest: auth.requireIdentity() }, handler);
+
+        const res = await app.inject({
+            method: "POST",
+            url: "/workspaces",
+            headers: { authorization: "Bearer tok" },
+        });
+
+        expect(res.statusCode).toBe(500);
+        expect(res.json().code).toBe("middleware_missing");
+        expect(handler).not.toHaveBeenCalled();
+    });
+
+    // Why the hook exists at all: the same route guarded by scope is a 400 for everyone,
+    // because there is no tenant in the request for the resolver to find.
+    it("guards a route requireScope cannot: no tenant to resolve", async () => {
+        const { auth, handler } = build({
+            principal: PRINCIPAL,
+            scopes: ["authz.tenants.write"],
+        });
+
+        await app.register(auth.plugin);
+        app.post(
+            "/scoped-workspaces",
+            { onRequest: auth.requireScope("authz.tenants.write") },
+            handler,
+        );
+
+        const res = await app.inject({
+            method: "POST",
+            url: "/scoped-workspaces",
+            headers: { authorization: "Bearer tok" },
+        });
+
+        expect(res.statusCode).toBe(400);
+        expect(res.json().code).toBe("tenant_required");
+        expect(handler).not.toHaveBeenCalled();
+    });
+});
+
 describe("audit context on Fastify", () => {
     let app: FastifyInstance;
 

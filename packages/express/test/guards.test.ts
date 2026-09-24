@@ -283,6 +283,108 @@ for (const [label, factory] of [
 
             expect(seen).toEqual(["bound", null]);
         });
+
+        /**
+         * The route requireIdentity exists for: `create_workspace` requires no scope at any
+         * tenant, and a POST /workspaces request names none, so requireScope cannot guard it --
+         * the last case here is the proof, and the reason this is not just a faster guard.
+         */
+        it("requireIdentity allows any principal, without an effective_scopes round trip", async () => {
+            const { auth, handler, query } = build(app, {
+                principal: PRINCIPAL,
+                scopes: [],
+            });
+
+            app.use(auth.authenticate());
+            app.post("/workspaces", auth.requireIdentity(), handler as never);
+            app.use(auth.errorHandler());
+
+            await request(app)
+                .post("/workspaces")
+                .set("authorization", "Bearer tok")
+                .expect(200);
+
+            expect(handler).toHaveBeenCalledOnce();
+            // Holding no scope at all is fine here: SQL decides, and needs no tenant to do it.
+            expect(
+                query.mock.calls.filter(c => String(c[0]).includes("effective_scopes")),
+            ).toHaveLength(0);
+        });
+
+        it("requireIdentity returns 401 when no credential was presented", async () => {
+            const { auth, handler, audited } = build(app, { principal: PRINCIPAL });
+
+            app.use(auth.authenticate());
+            app.post("/workspaces", auth.requireIdentity(), handler as never);
+            app.use(auth.errorHandler());
+
+            const res = await request(app).post("/workspaces").expect(401);
+
+            expect(res.body.error).toBe("unauthenticated");
+            expect(handler).not.toHaveBeenCalled();
+            expect(audited).toHaveLength(0);
+        });
+
+        it("requireIdentity returns 403, not 500, for a token with no authz identity", async () => {
+            const { auth, handler, audited } = build(app, {
+                principal: null,
+                verify: AUTH_USER,
+            });
+
+            app.use(auth.authenticate());
+            app.post("/workspaces", auth.requireIdentity(), handler as never);
+            app.use(auth.errorHandler());
+
+            const res = await request(app)
+                .post("/workspaces")
+                .set("authorization", "Bearer tok")
+                .expect(403);
+
+            expect(res.body.error).toBe("forbidden");
+            expect(handler).not.toHaveBeenCalled();
+            // Recorded with no tenant, exactly as enforceGuard's own second branch records it.
+            expect(audited).toHaveLength(1);
+            expect(audited[0]).toEqual(expect.arrayContaining(["authenticate", "request"]));
+        });
+
+        // A wiring bug must not be indistinguishable from an allow here either.
+        it("requireIdentity is a 500 when authenticate() was never mounted", async () => {
+            const { auth, handler } = build(app, { principal: PRINCIPAL });
+
+            app.post("/workspaces", auth.requireIdentity(), handler as never);
+            app.use(auth.errorHandler());
+
+            const res = await request(app)
+                .post("/workspaces")
+                .set("authorization", "Bearer tok")
+                .expect(500);
+
+            expect(res.body.error).toBe("middleware_missing");
+            expect(handler).not.toHaveBeenCalled();
+        });
+
+        it("guards a route requireScope cannot: no tenant to resolve", async () => {
+            const { auth, handler } = build(app, {
+                principal: PRINCIPAL,
+                scopes: ["authz.tenants.write"],
+            });
+
+            app.use(auth.authenticate());
+            app.post(
+                "/scoped-workspaces",
+                auth.requireScope("authz.tenants.write"),
+                handler as never,
+            );
+            app.use(auth.errorHandler());
+
+            const res = await request(app)
+                .post("/scoped-workspaces")
+                .set("authorization", "Bearer tok")
+                .expect(400);
+
+            expect(res.body.error).toBe("tenant_required");
+            expect(handler).not.toHaveBeenCalled();
+        });
     });
 }
 

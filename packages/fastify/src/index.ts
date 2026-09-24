@@ -9,6 +9,7 @@ import {
     createAuthzContext,
     credentialsFromHeaders,
     enforceGuard,
+    enforceIdentity,
     statusOf,
     type AuthKit,
     type AuthKitOptions,
@@ -148,6 +149,20 @@ export interface FastifyAuthKit {
      * distinguishable further down, and lets a public route sit in the same context.
      */
     readonly plugin: FastifyPluginAsync;
+    /**
+     * Requires somebody, not a scope: 401 without a credential, 403 for one that maps to no
+     * authz identity, and no database round trip either way.
+     *
+     * For the routes whose authority the request cannot name -- `createWorkspace`, which needs
+     * no scope at any tenant, and the writes anchored on a row's own tenant (`revokeBinding`,
+     * `updateRole`, `addRoleScope`, `removeRoleScope`, `revokeApiKey`) -- where SQL is the only
+     * place the anchor is readable. See `enforceIdentity` in the core for why a `requireScope`
+     * on some other tenant is worse than none.
+     *
+     * **Not a cheaper `requireScope`, and never on a read**: reads refuse by filtering, so this
+     * would answer `200 []` where `requireScope` answers 403.
+     */
+    requireIdentity(): AuthzHook;
     requireScope(scope: string, options?: GuardOptions): AuthzHook;
     /** One `effective_scopes` round trip regardless of how many scopes are listed. */
     requireAllScopes(scopes: readonly string[], options?: GuardOptions): AuthzHook;
@@ -208,6 +223,10 @@ export function createFastifyAuthKit(
             name: "@sirhc77/supabase-auth-kit-fastify",
             fastify: "5.x",
         }),
+
+        requireIdentity: () => async request => {
+            await enforceIdentity(getAuthContext(request));
+        },
 
         requireScope: (scope, options) => guard(checkScope(scope), options),
 
