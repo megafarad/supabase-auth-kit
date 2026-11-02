@@ -1,5 +1,11 @@
 # @sirhc77/supabase-auth-kit-core
 
+## 0.5.0
+
+### Minor Changes
+
+- 40d9897: Support requiring TOTP on routes. The `aal` claim of a Supabase access token now reaches the guards: `requireAal2()` and `{ aal2: true }` on the scope guards answer 403 `mfa_required` to a user below aal2, and refuse API keys unless `allowApiKeys` is set. A custom `verifyBearer` may return `{ authUserId, aal }`; a bare ID still works but is refused by these guards.
+
 ## 0.4.0
 
 ### Minor Changes
