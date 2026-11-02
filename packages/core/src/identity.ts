@@ -53,11 +53,42 @@ export function isInvalidToken(error: unknown): boolean {
     return typeof code === "string" && INVALID_TOKEN_CODES.has(code);
 }
 
-export type VerifyBearer = (token: string) => Promise<string | null>;
+/** Supabase's authenticator assurance level. `aal2` means a second factor was verified. */
+export type Aal = "aal1" | "aal2";
+
+/** What a verified token says about who presented it and how strongly they authenticated. */
+export interface VerifiedBearer {
+    authUserId: string;
+    /** Null when the token states no recognised level, which never satisfies an aal2 guard. */
+    aal: Aal | null;
+}
 
 /**
- * Verifies a Supabase access token and returns its subject -- the `auth.users` id -- or null
- * if the token is not acceptable.
+ * Returns the `auth.users` id, or null if the token is not acceptable.
+ *
+ * A bare string remains valid for verifiers that only know the subject. It carries no assurance
+ * level, so such a caller is refused by an aal2 guard rather than passed.
+ */
+export type VerifyBearer = (
+    token: string,
+) => Promise<string | VerifiedBearer | null>;
+
+/** Exported for testing; not part of the package's public surface via `index.ts`. */
+export function normalizeVerifiedBearer(
+    verified: string | VerifiedBearer | null,
+): VerifiedBearer | null {
+    return typeof verified === "string"
+        ? { authUserId: verified, aal: null }
+        : verified;
+}
+
+function aalFromClaim(claim: unknown): Aal | null {
+    return claim === "aal1" || claim === "aal2" ? claim : null;
+}
+
+/**
+ * Verifies a Supabase access token and returns its subject -- the `auth.users` id -- and
+ * assurance level, or null if the token is not acceptable.
  *
  * Verification is local and asymmetric. Supabase issues ES256 tokens signed with a key served
  * from JWKS, so this is not the legacy HS256 shared secret. jose caches the key set and
@@ -90,7 +121,9 @@ export function createBearerVerifier(options: JwtOptions): VerifyBearer {
 
             // Validated here so a malformed subject never reaches Postgres, where it would be
             // a 22P02 cast error -- a 500 for what is really a bad credential.
-            return isUuid(payload.sub) ? payload.sub : null;
+            return isUuid(payload.sub)
+                ? { authUserId: payload.sub, aal: aalFromClaim(payload["aal"]) }
+                : null;
         } catch (error) {
             if (isInvalidToken(error)) {
                 return null;

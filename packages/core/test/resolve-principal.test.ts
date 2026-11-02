@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { createAuthKit } from "../src/index.js";
-import { isInvalidToken } from "../src/identity.js";
+import { isInvalidToken, type VerifyBearer } from "../src/identity.js";
 import type { QueryFn, Row } from "../src/query.js";
 
 const AUTH_USER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -43,10 +43,7 @@ function routedQuery(handlers: {
  * the verifier chosen at construction, so a spread override would leave the real JWKS one in
  * place and these would stop being unit tests.
  */
-function kitWith(
-    query: QueryFn,
-    verifyBearer: (token: string) => Promise<string | null>,
-) {
+function kitWith(query: QueryFn, verifyBearer: VerifyBearer) {
     return createAuthKit({ query, verifyBearer });
 }
 
@@ -59,6 +56,7 @@ describe("resolvePrincipal", () => {
             principalId: null,
             kind: null,
             credentialPresented: false,
+            aal: null,
         });
         expect(query.seen).toEqual([]);
     });
@@ -71,6 +69,7 @@ describe("resolvePrincipal", () => {
             principalId: PRINCIPAL,
             kind: "api_key",
             credentialPresented: true,
+            aal: null,
         });
     });
 
@@ -103,10 +102,12 @@ describe("resolvePrincipal", () => {
             principalId: null,
             kind: null,
             credentialPresented: true,
+            aal: null,
         });
     });
 
-    it("resolves a valid bearer to a user principal", async () => {
+    // A verifier that knows only the subject keeps working, and states no assurance level.
+    it("resolves a bare-string verifier to a user principal with no aal", async () => {
         const query = routedQuery({ principalForAuthUser: PRINCIPAL });
         const kit = kitWith(query, async () => AUTH_USER);
 
@@ -114,7 +115,26 @@ describe("resolvePrincipal", () => {
             principalId: PRINCIPAL,
             kind: "user",
             credentialPresented: true,
+            aal: null,
         });
+    });
+
+    it("carries the verifier's aal onto the principal", async () => {
+        const query = routedQuery({ principalForAuthUser: PRINCIPAL });
+        const kit = kitWith(query, async () => ({ authUserId: AUTH_USER, aal: "aal2" }));
+
+        expect(await kit.resolvePrincipal({ bearer: "token" })).toEqual({
+            principalId: PRINCIPAL,
+            kind: "user",
+            credentialPresented: true,
+            aal: "aal2",
+        });
+    });
+
+    it("keeps kit.verifyBearer returning the bare id", async () => {
+        const kit = kitWith(routedQuery({}), async () => ({ authUserId: AUTH_USER, aal: "aal2" }));
+
+        expect(await kit.verifyBearer("token")).toBe(AUTH_USER);
     });
 
     /**
@@ -130,6 +150,7 @@ describe("resolvePrincipal", () => {
             principalId: null,
             kind: null,
             credentialPresented: true,
+            aal: null,
         });
         expect(query.seen).toEqual(["principal_for_auth_user"]);
     });
@@ -142,6 +163,7 @@ describe("resolvePrincipal", () => {
             principalId: null,
             kind: null,
             credentialPresented: true,
+            aal: null,
         });
         expect(query.seen).toEqual([]);
     });

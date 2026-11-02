@@ -1,3 +1,4 @@
+import type { VerifiedBearer } from "@sirhc77/supabase-auth-kit-core";
 import type { Express } from "express";
 import express5 from "express";
 // eslint-disable-next-line import/no-unresolved
@@ -19,7 +20,7 @@ interface Stub {
     /** null means "this token maps to no authz identity". */
     principal?: string | null;
     scopes?: string[];
-    verify?: string | null;
+    verify?: string | VerifiedBearer | null;
 }
 
 function build(app: Express, stub: Stub) {
@@ -474,6 +475,119 @@ describe("audit context on Express", () => {
         expect(audited[0]?.at(-1)).toBeNull();
     });
 });
+
+for (const [label, factory] of [
+    ["express 5", express5],
+    ["express 4", express4],
+] as const) {
+    describe(`aal2 guards on ${label}`, () => {
+        const atLevel = (aal: "aal1" | "aal2") => ({
+            principal: PRINCIPAL,
+            scopes: ["authz.roles.read"],
+            verify: { authUserId: AUTH_USER, aal },
+        });
+
+        function mount(
+            stub: Stub,
+            guard: (auth: ExpressAuthKit) => ReturnType<ExpressAuthKit["requireAal2"]>,
+        ) {
+            const app = (factory as typeof express5)();
+            const { auth, handler, query, audited } = build(app, stub);
+
+            app.use(auth.authenticate());
+            app.post("/workspaces", guard(auth), handler as never);
+            app.get("/t/:tenantId/x", guard(auth), handler as never);
+            app.use(auth.errorHandler());
+
+            return { app, handler, query, audited };
+        }
+
+        const scopeCalls = (query: ReturnType<typeof build>["query"]) =>
+            query.mock.calls.filter(c => String(c[0]).includes("effective_scopes"));
+
+        it("requireAal2 allows aal2 on a route with no tenant", async () => {
+            const { app, handler } = mount(atLevel("aal2"), auth => auth.requireAal2());
+
+            await request(app).post("/workspaces").set("authorization", "Bearer tok").expect(200);
+
+            expect(handler).toHaveBeenCalledOnce();
+        });
+
+        it("requireAal2 answers 403 mfa_required at aal1 and never runs the handler", async () => {
+            const { app, handler, audited } = mount(atLevel("aal1"), auth => auth.requireAal2());
+
+            const res = await request(app)
+                .post("/workspaces")
+                .set("authorization", "Bearer tok")
+                .expect(403);
+
+            expect(res.body.error).toBe("mfa_required");
+            expect(handler).not.toHaveBeenCalled();
+            expect(audited).toHaveLength(1);
+        });
+
+        it("refuses a verifier that states no level", async () => {
+            const { app, handler } = mount(
+                { principal: PRINCIPAL, verify: AUTH_USER },
+                auth => auth.requireAal2(),
+            );
+
+            await request(app).post("/workspaces").set("authorization", "Bearer tok").expect(403);
+
+            expect(handler).not.toHaveBeenCalled();
+        });
+
+        it("refuses an API key as forbidden unless the route allows keys", async () => {
+            const denied = mount({ principal: PRINCIPAL }, auth => auth.requireAal2());
+            const res = await request(denied.app)
+                .post("/workspaces")
+                .set("x-api-key", "sak_x_y")
+                .expect(403);
+
+            expect(res.body.error).toBe("forbidden");
+            expect(denied.handler).not.toHaveBeenCalled();
+
+            const allowed = mount({ principal: PRINCIPAL }, auth =>
+                auth.requireAal2({ allowApiKeys: true }),
+            );
+
+            await request(allowed.app).post("/workspaces").set("x-api-key", "sak_x_y").expect(200);
+        });
+
+        it("still answers 401 with no credential", async () => {
+            const { app, handler } = mount(atLevel("aal2"), auth => auth.requireAal2());
+
+            await request(app).post("/workspaces").expect(401);
+
+            expect(handler).not.toHaveBeenCalled();
+        });
+
+        it("requireScope with aal2 refuses aal1 before any scope query", async () => {
+            const { app, handler, query } = mount(atLevel("aal1"), auth =>
+                auth.requireScope("authz.roles.read", { aal2: true }),
+            );
+
+            const res = await request(app)
+                .get(`/t/${TENANT}/x`)
+                .set("authorization", "Bearer tok")
+                .expect(403);
+
+            expect(res.body.error).toBe("mfa_required");
+            expect(handler).not.toHaveBeenCalled();
+            expect(scopeCalls(query)).toHaveLength(0);
+        });
+
+        it("requireScope with aal2 allows aal2 holding the scope", async () => {
+            const { app, handler } = mount(atLevel("aal2"), auth =>
+                auth.requireScope("authz.roles.read", { aal2: true }),
+            );
+
+            await request(app).get(`/t/${TENANT}/x`).set("authorization", "Bearer tok").expect(200);
+
+            expect(handler).toHaveBeenCalledOnce();
+        });
+    });
+}
 
 describe("async wrapper shape", () => {
     // The assertion that actually pins Express 4 compatibility: the handler must be sync-outer,

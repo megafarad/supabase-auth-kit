@@ -40,12 +40,16 @@ A missing or bad credential yields a context with no principal and the request p
 | no context (guard mounted without `authenticate()`) | **500** `middleware_missing` — a wiring bug is never an allow |
 | no principal, no credential presented | **401** `unauthenticated` |
 | no principal, credential presented | **403** `forbidden` |
+| `{ aal2: true }` and a user below aal2 | **403** `mfa_required` |
+| `{ aal2: true }` and an API key, without `allowApiKeys` | **403** `forbidden` |
 | tenant unresolvable or not a UUID | **400** `tenant_required` |
 | principal lacks the scope | **403** `forbidden` |
 
 The second 403 is open question 1 made concrete: a token that verified against the project's own JWKS but maps to no `authz.users` row — reachable by registering an address a retired identity still holds. It is a clean 403, **never a 500**, and there is a test on both Express versions asserting the downstream handler did not run.
 
 `requireIdentity()` is the first two rows of that table and nothing else — core's `enforceIdentity`, shared with Fastify. It is for the routes whose authority the request cannot name: `createWorkspace` needs no scope at any tenant, and the writes anchored on a row's own tenant (`revokeBinding`, `updateRole`, `addRoleScope`, `removeRoleScope`, `revokeApiKey`) are governed by a tenant only SQL can read. On a tenant-less route `requireScope` answers **400 for everyone** — asserted on both Express versions right beside the `requireIdentity` cases — so it is not an alternative to the scope guard but the only guard those routes can have. **Never on a read**: reads refuse by filtering, so it would answer `200 []` where `requireScope` answers 403.
+
+`requireAal2()` is core's `enforceAal2`: the identity rows plus the two aal2 rows, with no tenant or scope. Use it on tenant-less routes, and `{ aal2: true }` on a scope guard elsewhere. See `packages/core/CLAUDE.md` for the rules.
 
 `getAuthContext(req)` throws rather than returning undefined, because the shape to make unwritable is `if (req.authKit && !(await req.authKit.has(t, s))) deny()` — which silently allows when the middleware is missing. Guards use the accessor, never optional chaining.
 

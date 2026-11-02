@@ -8,13 +8,16 @@ import {
     createAuthKit,
     createAuthzContext,
     credentialsFromHeaders,
+    enforceAal2,
     enforceGuard,
     enforceIdentity,
     statusOf,
+    type Aal2Options,
     type AuthKit,
     type AuthKitOptions,
     type AuthzContext,
     type GuardCheck,
+    type GuardRequirements,
     type RequestContext,
     type TenantResolver as CoreTenantResolver,
 } from "@sirhc77/supabase-auth-kit-core";
@@ -30,6 +33,7 @@ import fp from "fastify-plugin";
 export {
     ForbiddenError,
     HttpAuthzError,
+    MfaRequiredError,
     MiddlewareNotInstalledError,
     TenantRequiredError,
     UnauthenticatedError,
@@ -40,6 +44,8 @@ export {
     tenantFromQuery,
 } from "@sirhc77/supabase-auth-kit-core";
 export type {
+    Aal,
+    Aal2Options,
     AuditEntry,
     AuditFilter,
     AuditLogRow,
@@ -109,7 +115,7 @@ export function requestContextFromFastify(request: FastifyRequest): RequestConte
     };
 }
 
-export interface GuardOptions {
+export interface GuardOptions extends GuardRequirements {
     /** Overrides the factory-level tenant hook for one route. */
     resolveTenant?: TenantResolver;
 }
@@ -163,6 +169,14 @@ export interface FastifyAuthKit {
      * would answer `200 []` where `requireScope` answers 403.
      */
     requireIdentity(): AuthzHook;
+    /**
+     * Requires a user at aal2: `requireIdentity`, then 403 `mfa_required` for a user who has not
+     * verified a second factor. API keys get a 403 unless `allowApiKeys` is set.
+     *
+     * For routes with no tenant to check. Elsewhere pass `{ aal2: true }` to a scope guard. Like
+     * `requireIdentity`, never on its own on a read.
+     */
+    requireAal2(options?: Aal2Options): AuthzHook;
     requireScope(scope: string, options?: GuardOptions): AuthzHook;
     /** One `effective_scopes` round trip regardless of how many scopes are listed. */
     requireAllScopes(scopes: readonly string[], options?: GuardOptions): AuthzHook;
@@ -192,7 +206,7 @@ export function createFastifyAuthKit(
         const resolver = options?.resolveTenant ?? resolveTenant;
 
         return async request => {
-            await enforceGuard(getAuthContext(request), () => resolver(request), check);
+            await enforceGuard(getAuthContext(request), () => resolver(request), check, options);
         };
     }
 
@@ -226,6 +240,10 @@ export function createFastifyAuthKit(
 
         requireIdentity: () => async request => {
             await enforceIdentity(getAuthContext(request));
+        },
+
+        requireAal2: options => async request => {
+            await enforceAal2(getAuthContext(request), options);
         },
 
         requireScope: (scope, options) => guard(checkScope(scope), options),

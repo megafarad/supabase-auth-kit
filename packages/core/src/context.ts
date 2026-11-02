@@ -1,4 +1,5 @@
 import type { AuditEntry, RequestContext } from "./audit.js";
+import type { Aal } from "./identity.js";
 import type { ActorApi, AuthKit, PrincipalKind, ResolvedPrincipal } from "./index.js";
 
 /** What a framework binding attaches to a request once its credentials are resolved. */
@@ -7,6 +8,8 @@ export interface AuthzContext {
     readonly kind: PrincipalKind | null;
     /** Whether the request carried a credential at all, however it resolved. */
     readonly credentialPresented: boolean;
+    /** The bearer token's assurance level. Null for an API key or a token stating no level. */
+    readonly aal: Aal | null;
     /** What the binding could tell about the request, carried onto every audit row it writes. */
     readonly requestContext: RequestContext | null;
     /**
@@ -37,7 +40,7 @@ export interface AuthzContext {
  */
 export function createAuthzContext(
     kit: AuthKit,
-    { principalId, kind, credentialPresented }: ResolvedPrincipal,
+    { principalId, kind, credentialPresented, aal }: ResolvedPrincipal,
     requestContext: RequestContext | null = null,
 ): AuthzContext {
     // Promises, not resolved values: five concurrent has() calls in one tick must coalesce
@@ -64,6 +67,7 @@ export function createAuthzContext(
         principalId,
         kind,
         credentialPresented,
+        aal,
         requestContext,
         scopes,
 

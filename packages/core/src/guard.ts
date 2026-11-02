@@ -1,6 +1,7 @@
 import type { AuthzContext } from "./context.js";
 import {
     ForbiddenError,
+    MfaRequiredError,
     TenantRequiredError,
     UnauthenticatedError,
 } from "./http-errors.js";
@@ -57,6 +58,59 @@ export async function enforceIdentity(context: AuthzContext): Promise<void> {
     throw denial;
 }
 
+export interface Aal2Options {
+    /**
+     * Lets an API key through. Keys have no second factor, so they are refused by default: adding
+     * aal2 to a route must not leave a way around it that nobody chose.
+     */
+    allowApiKeys?: boolean | undefined;
+}
+
+export interface GuardRequirements extends Aal2Options {
+    /** Also require aal2, checked before the tenant is resolved. */
+    aal2?: boolean | undefined;
+}
+
+/**
+ * Requires a user who verified a second factor, on top of `enforceIdentity`.
+ *
+ *   user at aal2                 -> continue
+ *   user at anything else        -> 403 mfa_required
+ *   API key, allowApiKeys        -> continue
+ *   API key otherwise            -> 403 forbidden (a key cannot step up, so mfa_required would
+ *                                   send its caller after something it can never do)
+ *
+ * Strict by design: a user with no enrolled factor is refused like one who has not stepped up.
+ * The token cannot tell them apart, and passing the first would make aal2 optional for anyone
+ * who simply never enrols.
+ *
+ * Read from the token, so no round trip unless a denial is recorded. **This does not reach SQL**:
+ * only a route carrying this guard is protected, and a direct `kit.as()` call is not.
+ */
+export async function enforceAal2(
+    context: AuthzContext,
+    { allowApiKeys = false }: Aal2Options = {},
+): Promise<void> {
+    await enforceIdentity(context);
+
+    if (context.kind === "api_key" ? allowApiKeys : context.aal === "aal2") {
+        return;
+    }
+
+    const denial =
+        context.kind === "api_key"
+            ? new ForbiddenError("this route does not accept API keys")
+            : new MfaRequiredError();
+
+    await context.recordDenial({
+        action: "authorize",
+        targetType: "request",
+        reason: denial.message,
+    });
+
+    throw denial;
+}
+
 /**
  * The guard every framework binding runs. **The order here is the whole guard**, and it lives in
  * one place so the bindings cannot drift apart. Every branch either denies or continues; none
@@ -64,14 +118,15 @@ export async function enforceIdentity(context: AuthzContext): Promise<void> {
  *
  *   1. no principal, no credential presented  -> 401  \ enforceIdentity, above, which a binding
  *   2. no principal, credential presented     -> 403  / also exposes on its own
- *   3. tenant unresolvable or not a uuid      -> 400
- *   4. the check                              -> 403 on a missing scope
+ *   3. aal2 required and not met              -> 403    enforceAal2, only when asked for
+ *   4. tenant unresolvable or not a uuid      -> 400
+ *   5. the check                              -> 403 on a missing scope
  *
  * The principal is checked before the tenant is resolved, so an anonymous request never reaches
  * the tenant hook. A missing context -- the authentication step never ran -- is the binding's to
  * detect, because the fix it names is framework-specific; it must throw rather than call this.
  *
- * **Both 403 branches record a denied audit row, and only those two.** A 401 is not an
+ * **Every 403 branch records a denied audit row, and nothing else does.** A 401 is not an
  * authorization outcome -- nobody was refused anything, the request simply did not say who it
  * was -- and logging it would turn every unauthenticated probe into a write. A 400 is a
  * malformed request, not a refusal. The row is awaited before the error propagates, so a denial
@@ -82,8 +137,13 @@ export async function enforceGuard(
     context: AuthzContext,
     resolveTenant: () => unknown,
     check: GuardCheck,
+    { aal2 = false, allowApiKeys }: GuardRequirements = {},
 ): Promise<void> {
-    await enforceIdentity(context);
+    if (aal2) {
+        await enforceAal2(context, { allowApiKeys });
+    } else {
+        await enforceIdentity(context);
+    }
 
     const tenantId = await resolveTenant();
 

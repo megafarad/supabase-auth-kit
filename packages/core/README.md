@@ -80,7 +80,7 @@ Either way, the connection bypasses row-level security. Every call this package 
 | `jwt.audience` | The expected `aud`. Defaults to `authenticated` |
 | `jwt.algorithms` | Defaults to `["ES256", "RS256"]`. Never add `HS256`: accepting it alongside a JWKS lets anyone forge a token |
 | `jwt.rejectRoles` | Token `role` claims to refuse. Defaults to `["service_role", "anon"]` |
-| `verifyBearer` | Your own verifier, `(token) => Promise<authUserId \| null>`, used instead of `jwt`. Use it if you already verify tokens elsewhere, such as at a gateway or with `supabase.auth.getUser` |
+| `verifyBearer` | Your own verifier, `(token) => Promise<authUserId \| { authUserId, aal } \| null>`, used instead of `jwt`. Use it if you already verify tokens elsewhere, such as at a gateway or with `supabase.auth.getUser`. Return `aal` if you use aal2 guards: a bare ID states no level and is refused by them |
 
 Pass exactly one of `supabase`, `query` or `transport`, and either `jwt` or `verifyBearer`, or `createAuthKit` throws. With `jwt`, tokens are verified locally against a cached copy of the key set, so verifying a token doesn't call Supabase Auth. An invalid, expired or wrongly signed token verifies as `null`. If the key set itself can't be fetched, the error is thrown: an outage shouldn't look like every client sending a bad token.
 
@@ -102,7 +102,7 @@ if (await kit.hasScope(principalId, tenantId, "reports.run")) {
 | `principalForAuthUser(authUserId)` | The principal behind a Supabase user ID. `null` if there's no identity, or it's unclaimed, disabled or deleted |
 | `principalForApiKey(key)` | The principal behind a plaintext API key. `null` if the key is unknown, wrong, revoked or expired. Updates the key's `last_used_at`, so call it once per request |
 | `principalIsActive(principalId)` | Whether a claimed, enabled user or a live API key is behind the principal |
-| `resolvePrincipal({ bearer, apiKey })` | Turns request credentials into `{ principalId, kind, credentialPresented }`. See [Credentials](#credentials) |
+| `resolvePrincipal({ bearer, apiKey })` | Turns request credentials into `{ principalId, kind, credentialPresented, aal }`. `aal` is the token's `aal1` or `aal2`, and `null` for an API key. See [Credentials](#credentials) |
 | `as(actorPrincipalId)` | The read and write APIs, acting as that principal. See [Reads](#reads) and [Writes](#writes) |
 
 `hasScope` and `effectiveScopes` accept a `null` principal or tenant and answer `false` or `[]` without querying. That's the same answer the SQL would give. Scope names are compared exactly as written.

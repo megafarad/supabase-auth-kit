@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
     ForbiddenError,
+    MfaRequiredError,
     TenantRequiredError,
     UnauthenticatedError,
     checkAllScopes,
@@ -10,6 +11,7 @@ import {
     createAuthKit,
     createAuthzContext,
     credentialsFromHeaders,
+    enforceAal2,
     enforceGuard,
     enforceIdentity,
     type ResolvedPrincipal,
@@ -63,19 +65,26 @@ const anonymous: ResolvedPrincipal = {
     principalId: null,
     kind: null,
     credentialPresented: false,
+    aal: null,
 };
 
 const unresolved: ResolvedPrincipal = {
     principalId: null,
     kind: null,
     credentialPresented: true,
+    aal: null,
 };
 
 const user: ResolvedPrincipal = {
     principalId: PRINCIPAL,
     kind: "user",
     credentialPresented: true,
+    aal: "aal1",
 };
+
+const steppedUp: ResolvedPrincipal = { ...user, aal: "aal2" };
+
+const apiKey: ResolvedPrincipal = { ...user, kind: "api_key", aal: null };
 
 describe("enforceGuard", () => {
     it("rejects no credential as unauthenticated", async () => {
@@ -178,6 +187,116 @@ describe("enforceIdentity", () => {
             expect((viaIdentity as Error).constructor).toBe((viaGuard as Error).constructor);
             expect((viaIdentity as Error).message).toBe((viaGuard as Error).message);
         }
+    });
+});
+
+describe("enforceAal2", () => {
+    it("allows a user at aal2 without a round trip", async () => {
+        const { context, query, audited } = contextWith(steppedUp);
+
+        await expect(enforceAal2(context)).resolves.toBeUndefined();
+        expect(query).not.toHaveBeenCalled();
+        expect(audited).toHaveLength(0);
+    });
+
+    it.each([
+        ["aal1", user],
+        ["no stated level", { ...user, aal: null }],
+    ] as const)("refuses a user with %s as mfa_required, recording it", async (_label, resolved) => {
+        const { context, audited } = contextWith(resolved);
+
+        const error = await enforceAal2(context).catch((e: unknown) => e);
+
+        expect(error).toBeInstanceOf(MfaRequiredError);
+        expect(error).toMatchObject({ status: 403, code: "mfa_required" });
+        expect(audited).toHaveLength(1);
+        expect(audited[0]).toEqual(
+            expect.arrayContaining([PRINCIPAL, "authorize", "request", "this route requires aal2"]),
+        );
+    });
+
+    it("refuses an API key as plain forbidden, since a key cannot step up", async () => {
+        const { context, audited } = contextWith(apiKey);
+
+        const error = await enforceAal2(context).catch((e: unknown) => e);
+
+        expect(error).toBeInstanceOf(ForbiddenError);
+        expect(error).not.toBeInstanceOf(MfaRequiredError);
+        expect(error).toMatchObject({ code: "forbidden" });
+        expect(audited).toHaveLength(1);
+    });
+
+    it("lets an API key through only with allowApiKeys", async () => {
+        const { context } = contextWith(apiKey);
+
+        await expect(enforceAal2(context, { allowApiKeys: true })).resolves.toBeUndefined();
+    });
+
+    it("does not let allowApiKeys excuse a user", async () => {
+        const { context } = contextWith(user);
+
+        await expect(enforceAal2(context, { allowApiKeys: true })).rejects.toBeInstanceOf(
+            MfaRequiredError,
+        );
+    });
+
+    it("still answers 401 and 403 for nobody, as enforceIdentity does", async () => {
+        await expect(enforceAal2(contextWith(anonymous).context)).rejects.toBeInstanceOf(
+            UnauthenticatedError,
+        );
+
+        const error = await enforceAal2(contextWith(unresolved).context).catch((e: unknown) => e);
+
+        expect(error).toBeInstanceOf(ForbiddenError);
+        expect(error).not.toBeInstanceOf(MfaRequiredError);
+    });
+});
+
+describe("enforceGuard with aal2", () => {
+    it("refuses aal1 before the tenant hook or any scope query", async () => {
+        const { context, query } = contextWith(user, ["x"]);
+        const resolveTenant = vi.fn(() => TENANT);
+
+        await expect(
+            enforceGuard(context, resolveTenant, checkScope("x"), { aal2: true }),
+        ).rejects.toBeInstanceOf(MfaRequiredError);
+        expect(resolveTenant).not.toHaveBeenCalled();
+        expect(query).not.toHaveBeenCalled();
+    });
+
+    it("still checks the scope at aal2", async () => {
+        const { context } = contextWith(steppedUp, ["y"]);
+
+        await expect(
+            enforceGuard(context, () => TENANT, checkScope("x"), { aal2: true }),
+        ).rejects.toMatchObject({ code: "forbidden", scope: "x" });
+    });
+
+    it("allows aal2 holding the scope", async () => {
+        const { context } = contextWith(steppedUp, ["x"]);
+
+        await expect(
+            enforceGuard(context, () => TENANT, checkScope("x"), { aal2: true }),
+        ).resolves.toBeUndefined();
+    });
+
+    it("passes allowApiKeys through, and the key still needs the scope", async () => {
+        const options = { aal2: true, allowApiKeys: true };
+
+        await expect(
+            enforceGuard(contextWith(apiKey, ["x"]).context, () => TENANT, checkScope("x"), options),
+        ).resolves.toBeUndefined();
+        await expect(
+            enforceGuard(contextWith(apiKey).context, () => TENANT, checkScope("x"), options),
+        ).rejects.toMatchObject({ code: "forbidden", scope: "x" });
+    });
+
+    it("does not require aal2 unless asked", async () => {
+        const { context } = contextWith(user, ["x"]);
+
+        await expect(
+            enforceGuard(context, () => TENANT, checkScope("x")),
+        ).resolves.toBeUndefined();
     });
 });
 

@@ -10,9 +10,11 @@ import { effectiveScopes, hasScope } from "./authorize.js";
 import { rethrowAsAuthKitError } from "./errors.js";
 import {
     createBearerVerifier,
+    normalizeVerifiedBearer,
     principalForApiKey,
     principalForAuthUser,
     principalIsActive,
+    type Aal,
     type JwtOptions,
     type VerifyBearer,
 } from "./identity.js";
@@ -27,7 +29,7 @@ import {
 import { createWriteApi, type WriteApi } from "./writes.js";
 
 export type { QueryFn, Row } from "./query.js";
-export type { JwtOptions, VerifyBearer } from "./identity.js";
+export type { Aal, JwtOptions, VerifiedBearer, VerifyBearer } from "./identity.js";
 export type { WriteApi, WriteApiOptions } from "./writes.js";
 export type {
     AuditEntry,
@@ -75,6 +77,7 @@ export {
 export {
     ForbiddenError,
     HttpAuthzError,
+    MfaRequiredError,
     MiddlewareNotInstalledError,
     TenantRequiredError,
     UnauthenticatedError,
@@ -85,9 +88,12 @@ export {
     checkAllScopes,
     checkAnyScope,
     checkScope,
+    enforceAal2,
     enforceGuard,
     enforceIdentity,
+    type Aal2Options,
     type GuardCheck,
+    type GuardRequirements,
 } from "./guard.js";
 export { credentialsFromHeaders, type HeaderBag } from "./headers.js";
 export {
@@ -114,6 +120,8 @@ export interface ResolvedPrincipal {
     principalId: string | null;
     kind: PrincipalKind | null;
     credentialPresented: boolean;
+    /** From the bearer token. Null for an API key, no credential, or a token stating no level. */
+    aal: Aal | null;
 }
 
 export interface Credentials {
@@ -150,6 +158,9 @@ export interface AuthKitOptions {
      * Bring your own token verification, returning the `auth.users` id or null. Takes
      * precedence over `jwt`. Use this when the app already verifies tokens some other way --
      * `supabase.auth.getUser(token)`, an upstream gateway -- so verification is not done twice.
+     *
+     * Return `{ authUserId, aal }` for aal2 guards to work: a bare id carries no assurance level,
+     * so that caller is refused on every route requiring aal2.
      */
     verifyBearer?: VerifyBearer;
     /** Audit logging. Successful writes log themselves in SQL regardless of what is set here. */
@@ -284,7 +295,8 @@ export function createAuthKit(options: AuthKitOptions): AuthKit {
     const onAuditError = options.audit?.onError;
 
     return {
-        verifyBearer,
+        verifyBearer: async token =>
+            normalizeVerifiedBearer(await verifyBearer(token))?.authUserId ?? null,
 
         principalForAuthUser: authUserId =>
             principalForAuthUser(transport, authUserId),
@@ -304,21 +316,23 @@ export function createAuthKit(options: AuthKitOptions): AuthKit {
                     principalId,
                     kind: principalId === null ? null : "api_key",
                     credentialPresented: true,
+                    aal: null,
                 };
             }
 
             if (bearer) {
-                const authUserId = await verifyBearer(bearer);
+                const verified = normalizeVerifiedBearer(await verifyBearer(bearer));
 
                 const principalId =
-                    authUserId === null
+                    verified === null
                         ? null
-                        : await principalForAuthUser(transport, authUserId);
+                        : await principalForAuthUser(transport, verified.authUserId);
 
                 return {
                     principalId,
                     kind: principalId === null ? null : "user",
                     credentialPresented: true,
+                    aal: principalId === null ? null : (verified?.aal ?? null),
                 };
             }
 
@@ -326,6 +340,7 @@ export function createAuthKit(options: AuthKitOptions): AuthKit {
                 principalId: null,
                 kind: null,
                 credentialPresented: false,
+                aal: null,
             };
         },
 

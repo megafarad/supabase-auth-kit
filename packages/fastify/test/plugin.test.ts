@@ -1,4 +1,4 @@
-import { AuthzDeniedError } from "@sirhc77/supabase-auth-kit-core";
+import { AuthzDeniedError, type VerifiedBearer } from "@sirhc77/supabase-auth-kit-core";
 import fastify, { type FastifyInstance } from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -17,7 +17,7 @@ interface Stub {
     /** null means "this token maps to no authz identity". */
     principal?: string | null;
     scopes?: string[];
-    verify?: string | null;
+    verify?: string | VerifiedBearer | null;
 }
 
 function build(stub: Stub) {
@@ -553,6 +553,129 @@ describe("requireIdentity on Fastify", () => {
         expect(res.statusCode).toBe(400);
         expect(res.json().code).toBe("tenant_required");
         expect(handler).not.toHaveBeenCalled();
+    });
+});
+
+describe("aal2 guards on Fastify", () => {
+    let app: FastifyInstance;
+
+    const atLevel = (aal: "aal1" | "aal2") => ({
+        principal: PRINCIPAL,
+        scopes: ["authz.roles.read"],
+        verify: { authUserId: AUTH_USER, aal },
+    });
+
+    async function mount(
+        stub: Stub,
+        guard: (auth: FastifyAuthKit) => ReturnType<FastifyAuthKit["requireAal2"]>,
+    ) {
+        const built = build(stub);
+
+        await app.register(built.auth.plugin);
+        app.post("/workspaces", { onRequest: guard(built.auth) }, built.handler);
+        app.get("/t/:tenantId/x", { onRequest: guard(built.auth) }, built.handler);
+
+        return built;
+    }
+
+    const bearer = { authorization: "Bearer tok" };
+
+    beforeEach(() => {
+        app = fastify();
+    });
+
+    afterEach(async () => {
+        await app.close();
+    });
+
+    it("requireAal2 allows aal2 on a route with no tenant", async () => {
+        const { handler } = await mount(atLevel("aal2"), auth => auth.requireAal2());
+
+        const res = await app.inject({ method: "POST", url: "/workspaces", headers: bearer });
+
+        expect(res.statusCode).toBe(200);
+        expect(handler).toHaveBeenCalledOnce();
+    });
+
+    it("requireAal2 answers 403 mfa_required at aal1 and never runs the handler", async () => {
+        const { handler, audited } = await mount(atLevel("aal1"), auth => auth.requireAal2());
+
+        const res = await app.inject({ method: "POST", url: "/workspaces", headers: bearer });
+
+        expect(res.statusCode).toBe(403);
+        expect(res.json().code).toBe("mfa_required");
+        expect(handler).not.toHaveBeenCalled();
+        expect(audited).toHaveLength(1);
+    });
+
+    it("refuses a verifier that states no level", async () => {
+        const { handler } = await mount({ principal: PRINCIPAL, verify: AUTH_USER }, auth =>
+            auth.requireAal2(),
+        );
+
+        const res = await app.inject({ method: "POST", url: "/workspaces", headers: bearer });
+
+        expect(res.statusCode).toBe(403);
+        expect(handler).not.toHaveBeenCalled();
+    });
+
+    it("refuses an API key as forbidden by default", async () => {
+        const { handler } = await mount({ principal: PRINCIPAL }, auth => auth.requireAal2());
+
+        const res = await app.inject({
+            method: "POST",
+            url: "/workspaces",
+            headers: { "x-api-key": "sak_x_y" },
+        });
+
+        expect(res.statusCode).toBe(403);
+        expect(res.json().code).toBe("forbidden");
+        expect(handler).not.toHaveBeenCalled();
+    });
+
+    it("allows an API key when the route opts in", async () => {
+        await mount({ principal: PRINCIPAL }, auth => auth.requireAal2({ allowApiKeys: true }));
+
+        const res = await app.inject({
+            method: "POST",
+            url: "/workspaces",
+            headers: { "x-api-key": "sak_x_y" },
+        });
+
+        expect(res.statusCode).toBe(200);
+    });
+
+    it("still answers 401 with no credential", async () => {
+        const { handler } = await mount(atLevel("aal2"), auth => auth.requireAal2());
+
+        const res = await app.inject({ method: "POST", url: "/workspaces" });
+
+        expect(res.statusCode).toBe(401);
+        expect(handler).not.toHaveBeenCalled();
+    });
+
+    it("requireScope with aal2 refuses aal1 before any scope query", async () => {
+        const { handler, query } = await mount(atLevel("aal1"), auth =>
+            auth.requireScope("authz.roles.read", { aal2: true }),
+        );
+
+        const res = await app.inject({ url: `/t/${TENANT}/x`, headers: bearer });
+
+        expect(res.statusCode).toBe(403);
+        expect(res.json().code).toBe("mfa_required");
+        expect(handler).not.toHaveBeenCalled();
+        expect(effectiveScopeCalls(query)).toHaveLength(0);
+    });
+
+    it("requireScope with aal2 allows aal2 holding the scope", async () => {
+        const { handler } = await mount(atLevel("aal2"), auth =>
+            auth.requireScope("authz.roles.read", { aal2: true }),
+        );
+
+        const res = await app.inject({ url: `/t/${TENANT}/x`, headers: bearer });
+
+        expect(res.statusCode).toBe(200);
+        expect(handler).toHaveBeenCalledOnce();
     });
 });
 

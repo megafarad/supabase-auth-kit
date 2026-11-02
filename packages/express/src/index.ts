@@ -6,13 +6,16 @@ import {
     createAuthKit,
     createAuthzContext,
     credentialsFromHeaders,
+    enforceAal2,
     enforceGuard,
     enforceIdentity,
     statusOf,
+    type Aal2Options,
     type AuthKit,
     type AuthKitOptions,
     type AuthzContext,
     type GuardCheck,
+    type GuardRequirements,
     type RequestContext,
     type TenantResolver as CoreTenantResolver,
 } from "@sirhc77/supabase-auth-kit-core";
@@ -27,6 +30,7 @@ import { wrapAsync } from "./async.js";
 export {
     ForbiddenError,
     HttpAuthzError,
+    MfaRequiredError,
     MiddlewareNotInstalledError,
     TenantRequiredError,
     UnauthenticatedError,
@@ -37,6 +41,8 @@ export {
     tenantFromQuery,
 } from "@sirhc77/supabase-auth-kit-core";
 export type {
+    Aal,
+    Aal2Options,
     AuditEntry,
     AuditFilter,
     AuditLogRow,
@@ -111,7 +117,7 @@ export function requestContextFromExpress(request: Request): RequestContext {
     };
 }
 
-export interface GuardOptions {
+export interface GuardOptions extends GuardRequirements {
     /** Overrides the factory-level tenant hook for one route. */
     resolveTenant?: TenantResolver;
 }
@@ -160,6 +166,14 @@ export interface ExpressAuthKit {
      * would answer `200 []` where `requireScope` answers 403.
      */
     requireIdentity(): RequestHandler;
+    /**
+     * Requires a user at aal2: `requireIdentity`, then 403 `mfa_required` for a user who has not
+     * verified a second factor. API keys get a 403 unless `allowApiKeys` is set.
+     *
+     * For routes with no tenant to check. Elsewhere pass `{ aal2: true }` to a scope guard. Like
+     * `requireIdentity`, never on its own on a read.
+     */
+    requireAal2(options?: Aal2Options): RequestHandler;
     requireScope(scope: string, options?: GuardOptions): RequestHandler;
     /** One `effective_scopes` round trip regardless of how many scopes are listed. */
     requireAllScopes(scopes: readonly string[], options?: GuardOptions): RequestHandler;
@@ -184,7 +198,7 @@ export function createExpressAuthKit(
         const resolver = options?.resolveTenant ?? resolveTenant;
 
         return wrapAsync(async (req, _res, next) => {
-            await enforceGuard(getAuthContext(req), () => resolver(req), check);
+            await enforceGuard(getAuthContext(req), () => resolver(req), check, options);
 
             next();
         });
@@ -211,6 +225,13 @@ export function createExpressAuthKit(
         requireIdentity: () =>
             wrapAsync(async (req, _res, next) => {
                 await enforceIdentity(getAuthContext(req));
+
+                next();
+            }),
+
+        requireAal2: options =>
+            wrapAsync(async (req, _res, next) => {
+                await enforceAal2(getAuthContext(req), options);
 
                 next();
             }),
