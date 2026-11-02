@@ -45,7 +45,8 @@ Local and asymmetric. Supabase issues **ES256 via JWKS** — confirmed against a
 - The `sub` claim is validated as a UUID **before** it reaches Postgres. Otherwise a malformed subject is a `22P02` cast error — a 500 for what is really a bad credential.
 - A rejected token is a `null`. A JWKS outage is **not**: infrastructure failures are rethrown, because folding them into null would turn an outage into a wall of 401s that reads as a client problem.
 - `createRemoteJWKSet` is built once at factory time, never per request — that object *is* the key cache.
-- `verifyBearer` can be supplied directly instead of `jwt`, for apps that already verify tokens (`supabase.auth.getUser`, a gateway) and should not do it twice.
+- `verifyBearer` can be supplied directly instead of `jwt`, for apps that already verify tokens (`supabase.auth.getUser`, a gateway) and should not do it twice. It may return a bare id or `{ authUserId, aal }`. A bare id states no assurance level, so that caller is refused by every aal2 guard.
+- The `aal` claim is carried through as `ResolvedPrincipal.aal` and `AuthzContext.aal`. Only `aal1` and `aal2` are recognised; anything else is `null`, which never satisfies a guard. `kit.verifyBearer` still returns the bare id.
 
 ## Writes and reads
 
@@ -75,7 +76,7 @@ Everything a binding needs that is not framework-shaped lives here, so the secur
 
 | Module | Provides |
 | --- | --- |
-| `guard.ts` | `enforceGuard(context, resolveTenant, check)` — **the** decision order (401 / 403 / 400 / check), `enforceIdentity(context)` — its first two branches alone, and the `checkScope` / `checkAllScopes` / `checkAnyScope` builders |
+| `guard.ts` | `enforceGuard(context, resolveTenant, check)` — **the** decision order (401 / 403 / 400 / check), `enforceIdentity(context)` — its first two branches alone, `enforceAal2(context, options)` — those plus the aal2 requirement, and the `checkScope` / `checkAllScopes` / `checkAnyScope` builders |
 | `context.ts` | `AuthzContext` and `createAuthzContext(kit, resolved)` — the per-request scope memo (promises, not values, so concurrent checks coalesce) and the pre-bound `as` |
 | `http-errors.ts` | `HttpAuthzError` and subclasses, `statusOf`. `status` is what both Express's `finalhandler` and Fastify's default handler read |
 | `headers.ts` | `credentialsFromHeaders(headers, apiKeyHeader)` — Bearer only, and an array-valued API-key header is no key |
@@ -86,6 +87,17 @@ A missing context is the one guard branch left to the binding, because the fix i
 **`enforceIdentity` is branches 1 and 2 on their own** — somebody, without asking what they may do — and each adapter exposes it as `requireIdentity()`. It exists because some of the kit's own writes anchor authority on something the request cannot name: `create_workspace` requires no scope at any tenant (only `principal_is_active`), and `revoke_binding`, `update_role`, `add_role_scope`, `remove_role_scope` and `revoke_api_key` are governed by the tenant on the row being changed, which only SQL can read. A `checkScope` against whatever tenant the URL happens to carry checks the *wrong* tenant there, and on a route with no tenant at all — `POST /workspaces` — `enforceGuard` answers 400 to every request, legitimate ones included. What `requireIdentity` still buys in front of those: 401 and 403 stay apart, the handler never runs for a request with nobody behind it, and `context.as` is non-null by the time it does. Both adapters' suites assert the 400 that `requireScope` gives on such a route, so the reason it exists cannot be mistaken for a performance tweak.
 
 The branch is deliberately factored rather than copied: `enforceGuard` calls `enforceIdentity`, and a unit test asserts the two produce the same error class and message for both no-credential and unresolved-credential requests. **It is never a substitute for a scope check on a read** — reads refuse by filtering, so `requireIdentity` on a list route answers `200 []` where `requireScope` answers 403.
+
+## TOTP: `enforceAal2`
+
+Supabase Auth owns enrolment, challenges and code verification, and clients call `supabase.auth.mfa.*` directly. The kit only enforces the resulting `aal` claim, in `enforceAal2`, which each adapter exposes as `requireAal2()`. `enforceGuard` runs it when given `{ aal2: true }`, between the identity branches and tenant resolution, so an aal1 request costs no scope query. The order is 401 / 403 no identity / 403 aal2 / 400 / 403 scope.
+
+- **Strict.** A user with no enrolled factor gets the same 403 `mfa_required` as one who has not stepped up. The token cannot tell them apart, and passing the first would make aal2 optional for anyone who never enrols.
+- **API keys are refused unless the guard sets `allowApiKeys`**, so adding aal2 to a route cannot leave a bypass nobody chose. Their refusal is plain `forbidden`, because a key cannot step up. Both refusals record a denied audit row with no tenant.
+- **Route-level only.** SQL never sees `aal`: an unguarded route or a direct `kit.as()` call is not covered. Moving this into SQL would change the signature of every write.
+- **The level lasts as long as the token.** Verification is local, so removing a factor does not downgrade an already-issued aal2 token until it expires.
+
+`test/integration/mfa.integration.test.ts` enrols and verifies a real factor against the local Auth server, so the claim's shape is observed rather than assumed.
 
 ## Deliberate non-features
 

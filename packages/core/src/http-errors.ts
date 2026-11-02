@@ -37,9 +37,20 @@ export class UnauthenticatedError extends HttpAuthzError {
 export class ForbiddenError extends HttpAuthzError {
     readonly scope: string | undefined;
 
-    constructor(message: string, scope?: string) {
-        super(403, "forbidden", message);
+    constructor(message: string, scope?: string, code = "forbidden") {
+        super(403, code, message);
         this.scope = scope;
+    }
+}
+
+/**
+ * A user who could proceed by stepping up to aal2, whether by verifying an enrolled factor or by
+ * enrolling one first. A distinct code, because a client answers it differently from a missing
+ * scope: it prompts for a second factor rather than reporting a lack of permission.
+ */
+export class MfaRequiredError extends ForbiddenError {
+    constructor() {
+        super("this route requires aal2", undefined, "mfa_required");
     }
 }
 

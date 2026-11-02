@@ -79,7 +79,7 @@ Either connection bypasses row-level security. The kit only ever calls `authz` f
 | `jwt.audience` | The expected `aud`. Defaults to `authenticated` |
 | `jwt.algorithms` | Defaults to `["ES256", "RS256"]`. Never add `HS256` |
 | `jwt.rejectRoles` | Token `role` claims to refuse. Defaults to `["service_role", "anon"]` |
-| `verifyBearer` | Your own verifier, `(token) => Promise<authUserId \| null>`, used instead of `jwt`. Use it if you already verify tokens elsewhere, such as at a gateway or with `supabase.auth.getUser` |
+| `verifyBearer` | Your own verifier, `(token) => Promise<authUserId \| { authUserId, aal } \| null>`, used instead of `jwt`. Use it if you already verify tokens elsewhere, such as at a gateway or with `supabase.auth.getUser`. Return `aal` if you use aal2 guards: a bare ID states no level and is refused by them |
 | `resolveTenant` | **Required.** Where each request names its tenant. See [Tenant resolution](#tenant-resolution) |
 | `apiKeyHeader` | The header carrying an API key. Defaults to `x-api-key` |
 
@@ -165,6 +165,36 @@ app.post<{ Body: { name: string } }>(
 Since those routes are refused inside SQL, **install `auth.errorHandler`** so the refusal is a 403 rather than a 500.
 
 **Don't use it on reads.** Reads refuse by filtering, so a caller without the authority gets an empty page instead of an error: `requireIdentity` on a list route answers `200 []` where `requireScope` answers 403. It is also not a faster `requireScope` — on any route where a scope guard can ask the right question, use the scope guard.
+
+### Requiring TOTP
+
+Supabase Auth handles enrolment and verification. Enable TOTP on your project, and have your client call `supabase.auth.mfa.enroll`, `challenge` and `verify`. The kit only enforces the result, the `aal` claim in the access token:
+
+```ts
+app.delete(
+    "/t/:tenantId/roles/:id",
+    { onRequest: auth.requireScope("authz.roles.write", { aal2: true }) },
+    handler,
+);
+app.post("/workspaces", { onRequest: auth.requireAal2() }, handler); // a route with no tenant
+```
+
+This adds one step after the identity checks, before the tenant is resolved:
+
+| Caller | Status | `code` |
+| --- | --- | --- |
+| User at `aal2` | continues | |
+| User at anything else, including someone with no factor enrolled | 403 | `mfa_required` |
+| API key | 403 | `forbidden` |
+| API key, with `allowApiKeys: true` on the guard | continues | |
+
+Respond to `mfa_required` by sending the user to verify a factor, or to enrol one if they have none. Their next token carries `aal2`.
+
+Keep in mind:
+
+- **Only guarded routes are protected.** The database doesn't see `aal`, so a route without the guard, or a direct `kit.as()` call, isn't covered.
+- **The level lasts as long as the token.** Removing a factor doesn't downgrade an `aal2` token that has already been issued until it expires.
+- **There are no recovery codes.** Encourage users to enrol a second factor, and provide your own reset path for lost authenticators using Supabase's admin API.
 
 ## Tenant resolution
 
